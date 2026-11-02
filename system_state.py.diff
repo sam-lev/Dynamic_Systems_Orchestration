@@ -1,0 +1,64 @@
+--- /mnt/user-data/outputs/DSO_v4_5_complete/system_state.py	2026-09-02 06:48:54.111888000 +0000
++++ system_state.py	2026-09-02 08:53:25.933520366 +0000
+@@ -244,7 +244,15 @@
+     Symbols are ints; `n_symbols` may grow (alphabet is open) -- counts are
+     stored sparsely."""
+ 
+-    def __init__(self, prior: float = 0.5, forgetting: float = 0.999):
++    def __init__(self, prior: float = 0.05, forgetting: float = 0.999):
++        """
++        v4.6: `prior` reduced 0.5 -> 0.05. The prior mass is prior x |alphabet|,
++        so with 243 possible symbols a 0.5 prior asserted ~120 units of
++        imaginary evidence. A five-minute run yields ~4500 observations spread
++        across many symbols, so no individual symbol ever accumulated enough to
++        outweigh the assumption: the predictive distribution stayed near
++        uniform and the conditional entropy stayed at its maximum.
++        """
+         self.prior = float(prior)
+         self.forget = float(forgetting)
+         self.counts: Dict[int, Dict[int, float]] = {}
+@@ -263,9 +271,26 @@
+         return {t: (row.get(t, 0.0) + self.prior) / tot for t in self.alphabet} if self.alphabet else {}
+ 
+     def conditional_entropy(self, s: int) -> float:
++        """Uncertainty about the next symbol given `s`, in bits."""
+         d = self.next_distribution(s)
+         return shannon_entropy(list(d.values())) if d else 0.0
+ 
++    def max_entropy(self) -> float:
++        """Entropy of a uniform distribution over the symbols ACTUALLY SEEN.
++
++        Consumers normalise by this rather than by a fixed constant. The old
++        code divided by a hardcoded 3.0 and clipped to 1.0; since the raw
++        entropy over a 243-symbol alphabet sits well above 3 bits, the result
++        was exactly 1.0 on every frame and the four things ambiguity controls
++        (chord cardinality, note density, pitch gravitation, and one of the
++        four tension terms) were all frozen at one end of their range.
++        """
++        return float(math.log2(max(len(self.alphabet), 2)))
++
++    def normalised_conditional_entropy(self, s: int) -> float:
++        """Conditional entropy scaled to [0, 1] by the observed alphabet."""
++        return float(min(1.0, self.conditional_entropy(s) / max(self.max_entropy(), 1e-9)))
++
+     def stationary(self) -> Dict[int, float]:
+         tot = {s: sum(r.values()) for s, r in self.counts.items()}
+         z = sum(tot.values())
+@@ -572,12 +597,16 @@
+         Each quantized dimension contributes a digit (mixed radix)."""
+         def q(v, edges):
+             return int(np.searchsorted(np.asarray(edges), v))
++        # v4.6: the occupancy-entropy digit is dropped. It was the least
++        # informative of the five (it correlates strongly with blob count) and
++        # it tripled the alphabet, 81 -> 243. A smaller alphabet means each
++        # symbol accumulates observations sooner, which is what lets the
++        # transition model actually learn within a session.
+         digits = [
+             q(s.blob_count, self.quant["blob_count"]),
+             q(s.coherence, self.quant["coherence"]),
+             q(s.ke_total / self.ke_ref, self.quant["ke_norm"]),
+             q(agg["flux"], self.quant["flux_sign"]),
+-            q(s.occupancy_entropy, self.quant["occupancy_entropy"]),
+         ]
+         sym = 0
+         for d in digits:

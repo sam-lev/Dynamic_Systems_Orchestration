@@ -1,0 +1,83 @@
+{
+ "_version": 3,
+ "roles": {
+  "temperature": 0.35,
+  "virtual_signal_bias": 0.35
+ },
+ "grouping": {
+  "prior_phrase_secs": 9.0,
+  "evidence_rate": 0.04,
+  "rules": {
+   "gap": 0.8,
+   "change": 3.0,
+   "saddle": 2.0,
+   "changepoint": 3.0,
+   "regime": 1.2,
+   "relational": 1.2,
+   "coincidence": 0.8
+  }
+ },
+ "meter": {
+  "switch_cost": 1.0,
+  "forget": 0.94,
+  "temperature": 1.0,
+  "pf_mix": 0.65,
+  "rules": {
+   "periodicity": 2.0,
+   "london_prior": 0.4,
+   "cardinality": 1.6,
+   "ratio_evidence": 1.4
+  }
+ },
+ "meter_pf": {
+  "n_particles": 150,
+  "rules": {
+   "onset_alignment": 2.5,
+   "pf_continuity": 0.6,
+   "pf_london": 0.3
+  }
+ },
+ "timespan": {
+  "smoothing": 0.75,
+  "rules": {
+   "integrated_persistence": 0.4,
+   "tree_depth": 1.2,
+   "coupling": 0.8,
+   "recurrence": 0.4,
+   "energy": 1.0,
+   "surface": 2.0
+  }
+ },
+ "prolongation": {
+  "smoothing": 0.8,
+  "rules": {
+   "surprisal": 1.8,
+   "w_equilibrium": 0.5,
+   "ke": 1.4,
+   "cond_entropy": 0.4
+  }
+ },
+ "harmony": {
+  "switch_cost": 1.2,
+  "forget": 0.9,
+  "temperature": 1.1,
+  "step_rate_gain": 6.0,
+  "rules": {
+   "parsimony": 1.4,
+   "step_gate": 1.5,
+   "direction": 1.5,
+   "size_license": 1.8,
+   "content_fit": 0.8
+  }
+ },
+ "bocpd": {
+  "hazard": 0.025,
+  "signals": [
+   "ke",
+   "occupancy_entropy",
+   "flux",
+   "pair_dist_var",
+   "coherence"
+  ]
+ }
+}

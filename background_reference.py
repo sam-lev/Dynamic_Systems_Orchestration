@@ -1,0 +1,357 @@
+# background_reference.py -- Audible Lava / DSO v4.3
+#
+# A FROZEN per-pixel background reference: a non-adaptive alternative to MOG2.
+#
+# Why this exists
+# ---------------
+# MOG2 continuously adapts its background model. For a lava lamp the "foreground"
+# (the wax) moves only ~0.5-2 px/frame, so MOG2 absorbs slow/stationary wax into
+# the background within ~1s and the blobs fade out. A frozen reference sidesteps
+# adaptivity entirely: capture, freeze, then foreground = |frame - reference| >
+# threshold. Because it never adapts, it can never absorb a moving blob.
+#
+# Two capture modes (v4.3)
+# ------------------------
+# "cold"  -- the original: a short burst of frames from a SETTLED lamp (wax in
+#            the reservoir, no blobs), reduced by the per-pixel median. Fast
+#            (~3 s) and exact, but requires starting before the lamp warms up.
+#
+# "warm"  -- NEW. Capture from a lamp that is ALREADY RUNNING. Wax is present in
+#            every frame, so a short median would bake blobs into the reference.
+#            Instead we sample sparsely over a LONG window (default 90 s) and
+#            reduce with a low PERCENTILE rather than the median.
+#
+#            The reasoning: over a window spanning several blob transits, any
+#            given pixel shows background most of the time and wax only for the
+#            fraction of the window a blob happens to cover it. Wax is BRIGHTER
+#            than background, so the low percentile of each pixel's value
+#            distribution is the background value. Simulation over drifting and
+#            dwelling blobs: the 25th percentile stays within a couple of grey
+#            levels up to ~75% per-pixel wax occupancy, where the median fails
+#            past 50%. Hence percentile 25 (not 50) is the warm default.
+#
+#            Longer window = lower occupancy per pixel = better estimate. 90 s
+#            at 3 samples/s = 270 samples is a good default; the reservoir and
+#            any genuinely static bright region are still (correctly)
+#            suppressed, because those ARE background for our purposes.
+#
+# After a warm capture, refine() runs a second pass that additionally EXCLUDES
+# pixels currently detected as foreground, which cleans up any residual bias
+# from a blob that dwelled unusually long.
+#
+# Trade-off to be aware of: a frozen reference does NOT track lighting/exposure
+# drift. Lock the camera's exposure and white balance (see
+# audible_lava_camera_setup.sh) and re-capture (reset()) if conditions change.
+#
+# Lifecycle
+# ---------
+#   "collecting"  apply() accumulates frames and returns an all-foreground
+#                 (pass-through) mask, so detection still runs while the
+#                 reference is being built. Downstream (tracking/voices) is
+#                 expected to be gated off during this window.
+#   "ready"       the reference is frozen; apply() returns the thresholded
+#                 absolute difference from it.
+#
+# Call reset() to discard the reference and re-enter "collecting".
+
+import time
+
+import cv2
+import numpy as np
+
+
+class BackgroundReference:
+    # Fewest samples that may be reduced into a reference. Below this the
+    # percentile estimate is too noisy to trust.
+    MIN_SAMPLES = 20
+
+    """
+    Frozen per-pixel background, captured once then never adapted.
+
+    Args:
+        n_frames:       number of SAMPLES reduced into the reference.
+        diff_threshold: a pixel is foreground when |grey - reference| exceeds
+                        this (0-255, on the blurred greyscale image).
+        blur_sigma:     Gaussian blur applied before differencing, to suppress
+                        sensor noise. 0 disables.
+        settle_frames:  frames to discard at the start of a capture before
+                        accumulating, so camera auto-exposure can settle.
+        method:         "median" | "mean" | "percentile".
+                        "mean" is O(1) memory (handy on the Pi) but is the
+                        least outlier-robust and must not be used warm.
+        mode:           "cold" (default) or "warm". "warm" overrides method to
+                        "percentile" and applies the long-window sampling
+                        described above.
+        capture_secs:   warm mode only -- wall-clock length of the capture
+                        window. Should span several blob transits; the lamp's
+                        convection cycle is ~90-180 s, so 90 s is a floor and
+                        150 s is better if you can wait.
+        percentile:     warm mode only -- per-pixel percentile used as the
+                        background estimate. 25 tolerates ~75% wax occupancy.
+                        Lower it toward 10 if the reference still shows wax;
+                        raise it toward 40 if the reference looks too dark
+                        (over-subtracting, blobs read larger than they are).
+    """
+
+    def __init__(
+        self,
+        n_frames:       int   = 40,
+        diff_threshold: int   = 18,
+        blur_sigma:     float = 2.0,
+        settle_frames:  int   = 10,
+        method:         str   = "median",
+        # ── v4.3 warm-lamp capture ──────────────────────────────────────────
+        mode:           str   = "cold",
+        capture_secs:   float = 90.0,
+        percentile:     float = 25.0,
+        warm_samples:   int   = 270,
+    ):
+        if method not in ("median", "mean", "percentile"):
+            raise ValueError(f"method must be 'median', 'mean' or 'percentile', got {method!r}")
+        if mode not in ("cold", "warm"):
+            raise ValueError(f"mode must be 'cold' or 'warm', got {mode!r}")
+
+        self.mode           = mode
+        self.capture_secs   = float(capture_secs)
+        self.percentile     = float(np.clip(percentile, 1.0, 99.0))
+
+        if mode == "warm":
+            # Warm capture must be robust and must span a long window: force
+            # the percentile reducer and the sample budget regardless of what
+            # the caller passed for `method`/`n_frames`.
+            self.method   = "percentile"
+            self.n_frames = max(30, int(warm_samples))
+        else:
+            self.method   = method
+            self.n_frames = max(1, int(n_frames))
+
+        self.diff_threshold = int(diff_threshold)
+        self.blur_sigma     = float(blur_sigma)
+        self.settle_frames  = max(0, int(settle_frames))
+
+        self.reference: np.ndarray | None = None   # frozen uint8 HxW, or None
+        self._settle_left = self.settle_frames
+        self._stack: list = []        # for "median" / "percentile"
+        self._sum:   np.ndarray | None = None   # for "mean" (float32 accumulator)
+        self._count = 0               # for "mean"
+
+        # Warm-capture pacing: sample every Nth frame so `n_frames` samples
+        # span `capture_secs`. Recomputed on the first apply() once we can
+        # observe the real frame rate.
+        self._capture_started: float | None = None
+        self._last_sample:     float | None = None
+        self._frames_seen  = 0
+
+        # Set by refine(); excludes currently-foreground pixels from the
+        # second pass. None outside a refine.
+        self._exclude_fg   = False
+        self._masked_sum:   np.ndarray | None = None
+        self._masked_count: np.ndarray | None = None
+
+    # ── State ────────────────────────────────────────────────────────────────
+    @property
+    def ready(self) -> bool:
+        return self.reference is not None
+
+    @property
+    def progress(self) -> tuple:
+        """(collected, target) samples -- for HUD display during capture."""
+        if self.ready and not self._exclude_fg:
+            return (self.n_frames, self.n_frames)
+        got = self._count if self.method == "mean" else len(self._stack)
+        return (got, self.n_frames)
+
+    @property
+    def eta_secs(self) -> float:
+        """Estimated seconds remaining in the current capture (0 when ready)."""
+        if self.ready and not self._exclude_fg:
+            return 0.0
+        if self._capture_started is None:
+            return self.capture_secs if self.mode in ("warm",) else 0.0
+        if self.mode == "warm" or self._exclude_fg:
+            return max(0.0, self.capture_secs - (time.time() - self._capture_started))
+        got, target = self.progress
+        if got <= 0:
+            return 0.0
+        elapsed = time.time() - self._capture_started
+        return max(0.0, (elapsed / got) * (target - got))
+
+    def status(self) -> str:
+        """One-line HUD string."""
+        if self.ready and not self._exclude_fg:
+            return f"bg: ready ({self.mode}, {self.method})"
+        got, target = self.progress
+        return (f"bg: capturing {self.mode} {got}/{target} "
+                f"(~{self.eta_secs:.0f}s left)")
+
+    def reset(self, *, mode: str | None = None) -> None:
+        """Discard the reference and start a fresh capture.
+
+        `mode` optionally switches cold/warm for this capture, so a HUD key can
+        request a warm re-capture on a lamp that is already running.
+        """
+        if mode is not None:
+            if mode not in ("cold", "warm"):
+                raise ValueError(f"mode must be 'cold' or 'warm', got {mode!r}")
+            self.mode = mode
+            if mode == "warm":
+                self.method = "percentile"
+                self.n_frames = max(30, self.n_frames)
+        self.reference       = None
+        self._settle_left    = self.settle_frames
+        self._stack          = []
+        self._sum            = None
+        self._count          = 0
+        self._capture_started = None
+        self._last_sample    = None
+        self._frames_seen    = 0
+        self._exclude_fg     = False
+        self._masked_sum     = None
+        self._masked_count   = None
+
+    def refine(self) -> None:
+        """Start a second pass that excludes currently-foreground pixels.
+
+        Only meaningful after a warm capture: the existing reference is kept
+        and used to classify foreground, while a new estimate is accumulated
+        from background pixels only. Cleans up residual bias where a blob
+        dwelled over one region for an unusually large share of the window.
+        """
+        if not self.ready:
+            raise RuntimeError("refine() requires an existing reference; call reset() first")
+        self._exclude_fg      = True
+        self._stack           = []
+        self._masked_sum      = None
+        self._masked_count    = None
+        self._capture_started = None
+        self._last_sample     = None
+        self._frames_seen     = 0
+
+    # ── Diagnostics ──────────────────────────────────────────────────────────
+    def occupancy(self, grey: np.ndarray) -> float:
+        """Fraction of pixels currently reading as foreground.
+
+        Sanity check for a warm capture: if this sits above ~0.5 for long
+        stretches, the window is too short (per-pixel wax occupancy is too
+        high) -- lengthen capture_secs or lower `percentile`.
+        """
+        if not self.ready:
+            return 1.0
+        return float((self.apply(grey, update=False) > 0).mean())
+
+    # ── Core ─────────────────────────────────────────────────────────────────
+    def _prep(self, grey: np.ndarray) -> np.ndarray:
+        if self.blur_sigma > 0:
+            return cv2.GaussianBlur(grey, (0, 0), sigmaX=self.blur_sigma)
+        return grey
+
+    def _due(self) -> bool:
+        """Warm mode: is another sample due?
+
+        Paced on WALL CLOCK, not on a frame-rate estimate: take a sample every
+        capture_secs / n_frames seconds. This is independent of TARGET_FPS,
+        DETECT_K, and any frame-rate jitter, and it guarantees the capture
+        finishes in about capture_secs regardless of how fast frames arrive.
+        """
+        if self.mode != "warm":
+            return True
+        now = time.time()
+        if self._capture_started is None:
+            self._capture_started = now
+            self._last_sample = now
+            return True
+        interval = self.capture_secs / max(self.n_frames, 1)
+        if (now - self._last_sample) >= interval:
+            self._last_sample = now
+            return True
+        return False
+
+    def _window_elapsed(self) -> bool:
+        return (self._capture_started is not None
+                and (time.time() - self._capture_started) >= self.capture_secs)
+
+    def _reduce(self) -> np.ndarray:
+        stack = np.stack(self._stack, axis=0)                  # (N,H,W)
+        if self.method == "percentile":
+            ref = np.percentile(stack, self.percentile, axis=0)
+        else:
+            ref = np.median(stack, axis=0)
+        return ref.astype(np.uint8)
+
+    def apply(self, grey: np.ndarray, *, update: bool = True) -> np.ndarray:
+        """
+        Return a uint8 foreground mask (0/255), same HxW as `grey`.
+
+        While collecting, returns an all-foreground (255) mask. Once ready,
+        returns |grey - reference| > diff_threshold.
+
+        Args:
+            grey:   single-channel uint8 frame.
+            update: when False, do not advance the capture or mutate state
+                    (a non-consuming peek -- used by debug-mask previews so
+                    they don't steal frames from the live capture).
+        """
+        g = self._prep(grey)
+
+        # ── Refine pass: reference exists, but we are re-estimating from
+        # background pixels only. Masks are live throughout.
+        if self._exclude_fg and update:
+            diff = cv2.absdiff(g, self.reference)
+            _, fg = cv2.threshold(diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
+            bgmask = (fg == 0)
+            gf = g.astype(np.float32)
+            if self._masked_sum is None:
+                self._masked_sum   = np.zeros_like(gf)
+                self._masked_count = np.zeros_like(gf)
+            self._masked_sum   += np.where(bgmask, gf, 0.0)
+            self._masked_count += bgmask.astype(np.float32)
+            self._frames_seen  += 1
+            if self._capture_started is None:
+                self._capture_started = time.time()
+            if (time.time() - self._capture_started) >= self.capture_secs:
+                # Any pixel never seen as background keeps its old value.
+                seen = self._masked_count > 0
+                refined = self.reference.astype(np.float32)
+                refined[seen] = (self._masked_sum[seen] / self._masked_count[seen])
+                self.reference = refined.astype(np.uint8)
+                self._exclude_fg   = False
+                self._masked_sum   = None
+                self._masked_count = None
+
+        if not self.ready:
+            if update:
+                self._frames_seen += 1
+                if self._capture_started is None and self.mode != "warm":
+                    self._capture_started = time.time()
+                if self._settle_left > 0:
+                    self._settle_left -= 1
+                    return np.full(g.shape[:2], 255, dtype=np.uint8)
+
+                if self._due():
+                    if self.method == "mean":
+                        self._sum = g.astype(np.float32) if self._sum is None \
+                            else self._sum + g
+                        self._count += 1
+                        if self._count >= self.n_frames:
+                            self.reference = (self._sum / self._count).astype(np.uint8)
+                            self._sum = None
+                    else:                      # median / percentile
+                        self._stack.append(g.copy())
+
+                # Warm capture ends when the window elapses (or the sample
+                # budget fills, whichever comes first) so a slow frame rate
+                # cannot stretch the capture indefinitely. MIN_SAMPLES guards
+                # against reducing a near-empty stack.
+                if self.method in ("median", "percentile"):
+                    full = len(self._stack) >= self.n_frames
+                    timed_out = self.mode == "warm" and self._window_elapsed() \
+                        and len(self._stack) >= self.MIN_SAMPLES
+                    if full or timed_out:
+                        self.reference = self._reduce()
+                        self._stack = []
+            # Pass-through while the reference is still being built.
+            return np.full(g.shape[:2], 255, dtype=np.uint8)
+
+        diff = cv2.absdiff(g, self.reference)
+        _, mask = cv2.threshold(diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
+        return mask

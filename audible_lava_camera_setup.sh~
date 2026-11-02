@@ -1,0 +1,17 @@
+#!/bin/bash
+# audible_lava_camera_setup.sh — run before launching the pipeline.
+# Locks the C920 into deterministic, calibration-stable state.
+
+uvcc set auto_exposure_mode 1                  # manual exposure
+uvcc set absolute_exposure_time 333            # ~1/30s
+uvcc set gain 0                                # no amplification
+uvcc set auto_white_balance_temperature 0      # manual WB
+uvcc set white_balance_temperature 3000        # tungsten bulb
+uvcc set brightness 128                        # default
+uvcc set contrast 128                          # default
+uvcc set saturation 128                        # default — critical
+uvcc set sharpness 0                           # no edge enhancement
+uvcc set focus_auto 0                          # autofocus off
+uvcc set focus_absolute 0                      # focus at infinity for fixed setup
+
+echo "Camera locked. Verify with: uvcc get <param>"

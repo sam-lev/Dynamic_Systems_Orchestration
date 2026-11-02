@@ -1,0 +1,10 @@
+opencv-python>=4.8.0
+numpy>=1.24.0
+scipy>=1.10.0
+python-osc>=1.8.0
+gudhi>=3.7.0
+# v4.0 (Phase 1): keyboard controller via pygame
+pygame>=2.5
+# v4.0 (Phase 2 prep): MIDI controller stub uses these when activated
+mido>=1.3.0
+python-rtmidi>=1.5.0

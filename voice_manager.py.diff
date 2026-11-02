@@ -1,0 +1,31 @@
+--- /mnt/user-data/outputs/v4_3_fixes/voice_manager.py	2026-09-02 00:22:38.294369000 +0000
++++ voice_manager.py	2026-09-02 05:42:00.394453999 +0000
+@@ -598,8 +598,27 @@
+ 
+     def note_on(self, slot_id: int, note: int, velocity: int) -> None:
+         v = self.voice(slot_id)
+-        if v is None or v.state == VoiceState.IDLE:
++        if v is None:
+             return
++        # v4.4: an IDLE slot used to swallow the note entirely, so the MPE
++        # keyboard was silent unless a blob happened to be bound to the
++        # selected slot -- the whole player path existed but was unreachable
++        # in the common case. Pressing a key on an idle slot now SPAWNS a
++        # KEYBOARD_ONLY voice there, which is what the state diagram at the
++        # top of this file always described (IDLE -> KEYBOARD_ONLY).
++        if v.state == VoiceState.IDLE:
++            v.synth         = SynthState.default()
++            v.routing       = []
++            v.events        = []
++            v.edited_params = set()
++            v.state         = VoiceState.KEYBOARD_ONLY
++            v.blob_id       = None
++            v.synth_kind    = "mpe"
++            v.born_at       = time.time()
++            v.spawn_origin  = "keyboard"
++            v.synth.base_note = float(note)
++            v.synth.gate    = 1
++            self._send_spawn(v, blob=None, fire_strike=False, gate=1)
+         # Player note input should sound through the normal playable MPE voice.
+         # A HYBRID/BLOB voice may later re-enter bass mode if the blob still
+         # satisfies the gesture condition.

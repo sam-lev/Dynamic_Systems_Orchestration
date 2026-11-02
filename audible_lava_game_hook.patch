@@ -1,0 +1,35 @@
+--- /tmp/a.py	2026-08-22 08:38:10.597333536 +0000
++++ /tmp/b.py	2026-08-22 08:38:10.618089076 +0000
+@@ -48,6 +48,7 @@
+ from blob_detection  import BlobDetector
+ from blob_tracker    import BlobTracker
+ from merge_tree      import compute_merge_tree, draw_tree_overlay
++from lava_bridge     import LavaBridge            # Lava Climb game feed
+ 
+ # v4.0 modules
+ from voice_manager   import VoiceManager, VoiceState
+@@ -408,6 +409,8 @@
+ 
+     # ── Loop state ────────────────────────────────────────────────────────
+     frame_interval = 1.0 / TARGET_FPS
++    bridge = LavaBridge(profile, fps=TARGET_FPS,
++                        send_video="--no-game-video" not in sys.argv)
+     start_time     = time.time()
+     frame_count    = 0
+     last_blobs     = []   # most recent detection result (overlay continuity)
+@@ -472,6 +475,7 @@
+                 # Detection frames pass `blobs` (full association + Kalman
+                 # correction); intervening frames pass None (predict-only).
+                 tracked = tracker.update(blobs, roi, grey=grey)
++                bridge.publish(tracker, roi)
+ 
+                 # ── 3. Merge tree (visualisation; detection frames only) ──
+                 if show_tree and blobs is not None:
+@@ -606,6 +610,7 @@
+             cv2.destroyAllWindows()
+         if keyboard is not None:
+             keyboard.close()
++        bridge.close()
+         print(f"Done. {frame_count} frames processed.")
+ 
+ 

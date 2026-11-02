@@ -1,0 +1,22 @@
+--- /mnt/user-data/outputs/DSO_v4_5_complete/score_governor.py	2026-09-02 06:48:54.102417000 +0000
++++ score_governor.py	2026-09-02 08:53:39.100762627 +0000
+@@ -711,12 +711,17 @@
+         wp = lambda k, d: self.weights.get(f"prolongation.rules.{k}", d)
+         surpr_norm = min(1.0, summ.surprisal / 6.0)
+         raw_t = (wp("surprisal", 1.0) * surpr_norm + wp("w_equilibrium", 1.0) * min(1.0, summ.w_equilibrium * 2.0)
+-                 + wp("ke", 0.8) * min(1.0, summ.ke_total / st.ke_ref) + wp("cond_entropy", 0.8) * min(1.0, summ.cond_entropy / 3.0))
++                 + wp("ke", 0.8) * min(1.0, summ.ke_total / st.ke_ref)
++                 + wp("cond_entropy", 0.8)
++                 * self.state_tracker.markov.normalised_conditional_entropy(summ.symbol))
+         raw_t /= max(wp("surprisal", 1.0) + wp("w_equilibrium", 1.0) + wp("ke", 0.8) + wp("cond_entropy", 0.8), 1e-6)
+         sm = self.weights.get("prolongation.smoothing", 0.92)
+         self.tension = sm * self.tension + (1 - sm) * raw_t
+         s.tension, s.surprisal = float(self.tension), float(summ.surprisal)
+-        s.ambiguity = float(min(1.0, summ.cond_entropy / 3.0))
++        # v4.6: normalise by the OBSERVED alphabet rather than a fixed 3.0.
++        # The old divisor saturated at 1.0 on every frame, freezing chord
++        # cardinality, density ceiling, gravitation and one tension term.
++        s.ambiguity = self.state_tracker.markov.normalised_conditional_entropy(summ.symbol)
+         # hazard: rising probability of a lifecycle event as the mean gap is approached
+         gap = self.t - self.last_event_t
+         self.hazard_stats["mean_gap"] = 0.995 * self.hazard_stats["mean_gap"] + 0.005 * gap

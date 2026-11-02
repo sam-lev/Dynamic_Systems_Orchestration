@@ -1,0 +1,39 @@
+--- /mnt/user-data/outputs/v4_2_score_grammar/audible_lava.py	2026-09-01 21:56:00.171443000 +0000
++++ audible_lava.py	2026-09-02 05:27:08.921024528 +0000
+@@ -422,7 +422,10 @@
+                              weights_path="governor_weights.json",
+                              runtime_path="governor_runtime.json", log_path="governor_log.txt")
+     voices.score_governor = governor        # for EDIT-surface param routing
+-    use_governor = "--no-governor" not in sys.argv
++    use_governor  = "--no-governor" not in sys.argv
++    # The gated \mpeHit pattern layer. Requires blob_synth_hits.scd to have
++    # been evaluated in SuperCollider after blob_synth.scd.
++    pattern_layer = use_governor and "--no-patterns" not in sys.argv
+     start_time     = time.time()
+     frame_count    = 0
+     last_blobs     = []   # most recent detection result (overlay continuity)
+@@ -507,6 +510,24 @@
+                     )
+                     voices.score_state = score_state
+ 
++                    # ── 3c. Pattern (hit) layer -> timed OSC bundles ────────
++                    # This is what produces an audible BEAT. Without it the
++                    # elastic clock computes a tempo that nothing consumes and
++                    # only the sustained \mpeVoice sounds, which reads as a
++                    # drone however the governor weights are set.
++                    if pattern_layer:
++                        try:
++                            msgs = governor.tick_patterns(
++                                tracked,
++                                voice_of=lambda bid: voices.voices_by_blob.get(bid),
++                            )
++                            for t_on, args in msgs:
++                                voices.osc.send_message(args[0], args[1:])
++                        except Exception as exc:
++                            if not getattr(dispatch_controller_event, "_pat_warned", False):
++                                print(f"  ! pattern layer error: {exc}")
++                                dispatch_controller_event._pat_warned = True
++
+                 # ── 4. Lifecycle: tracker events → BindingManager ────────
+                 binding.handle_tracker_events(tracker.events, tracked)
+ 

@@ -1,0 +1,291 @@
+# routing.py -- Audible Lava / DSO v4.0 (MPE Edition)
+#
+# The bridge between blob CV features (sources) and voice synth parameters
+# (destinations). Each Voice carries a list of Routing(src, dst, depth, curve)
+# tuples; every frame the runtime reads the bound blob's normalised feature,
+# passes it through the curve, scales by depth, and adds the result to the
+# parameter's editable base value before sending to SuperCollider.
+#
+# Design choices:
+#   - Direct-destination routing (not internal SC mod-matrix). The final
+#     value = base + depth * curve(source_norm) is computed in Python and
+#     sent as the actual SC parameter. SC-side .lag smooths between frames.
+#   - Sources are normalised per-feature (y_norm and x_norm already are; vy,
+#     persistence, etc. are mapped to [0,1] or [-1,1] in the runtime).
+#   - Curves are pre-tabulated as functions; new ones are trivial to add.
+#   - EventRoute handles discrete events (direction_change, merge, split).
+#
+# Default routings on BLOB_ONLY voices (v3.2 — hue-free):
+#       y_norm        -> pitch        (depth +24 semitones)
+#       persistence   -> amp          (curve SQRT, depth +0.30)
+#       vy            -> wave_pos     (depth +0.40, LIN)   — kinematic
+#       area          -> wave_pos     (depth +0.40, SQRT)  — geometric
+#       elongation    -> res          (depth +0.6)
+#       orientation   -> pan          (depth +1.0)
+#       direction_change -> attack/release preset (event)
+#
+# The default mean_hue → wave_pos mapping was removed in v3.2 because
+# camera-firmware variations (saturation pinning, white-balance drift) made
+# blob hue an unreliable continuous source. Source.MEAN_HUE remains
+# available in the enum for users who want to wire it explicitly.
+
+from __future__ import annotations
+import math
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Optional
+
+
+# ── Sources (blob CV features) ───────────────────────────────────────────────
+class Source(str, Enum):
+    Y_NORM       = "y_norm"        # 0..1 (top of lamp = 1)
+    X_NORM       = "x_norm"        # 0..1
+    VY           = "vy"            # vertical velocity, normalised to [-1, 1]
+    PERSISTENCE  = "persistence"   # 0..1 (normalised to expected_persistence_max)
+    AREA         = "area"          # 0..1 (normalised to blob_area_max)
+    MEAN_HUE     = "mean_hue"      # 0..1 (mean_hue / 180.0)
+    ELONGATION   = "elongation"    # 0..1
+    ORIENTATION  = "orientation"   # -1..1 (pi/2 mapped to 1)
+    AGE          = "age"           # 0..1 (saturating at 600 frames)
+    # ── v4.1: motion & change-of-state sources ───────────────────────────
+    VX           = "vx"            # horizontal velocity, normalised to [-1, 1]
+    SPEED        = "speed"         # |velocity|, 0..1  (kinetic energy)
+    D_AREA       = "d_area"        # fractional area change/s, [-1, 1]
+                                   #   + = expanding / blooming
+    D_PERSISTENCE= "d_persistence" # fractional persistence change/s, [-1, 1]
+                                   #   + = consolidating, - = dissolving
+    ACCEL        = "accel"         # |buoyancy accel|, 0..1 (turning intensity)
+
+
+# ── Destinations (synth parameters that accept continuous modulation) ────────
+class Dest(str, Enum):
+    PITCH    = "pitch"     # base = MIDI note  (depth in semitones)
+    AMP      = "amp"       # base in [0..1]    (depth additive)
+    PAN      = "pan"       # base in [-1..1]   (depth additive)
+    CUTOFF   = "cutoff"    # base in Hz        (depth in Hz)
+    RES      = "res"       # base in [0..1]    (depth additive)
+    WAVE_POS = "wave_pos"  # base in [0..1]    (depth additive)
+    ATTACK   = "attack"    # base in seconds   (depth in seconds)
+    RELEASE  = "release"   # base in seconds   (depth in seconds)
+    # ── v4.1: expressive timbre destinations (see \mpeVoice) ─────────────
+    DETUNE   = "detune"    # 0..1 unison spread / beating
+    SHIMMER  = "shimmer"   # 0..1 vibrato + tremolo depth
+    NOISE    = "noise"     # 0..1 breath / air blend
+    DRIVE    = "drive"     # 0..1 wavefold saturation
+    FMODE    = "fmode"     # 0..1 filter morph (0=LP, 0.5=BP, 1=HP)
+
+
+# ── Normalisation scales for v4.1 motion/rate sources ────────────────────────
+# Tunable working ceilings. A source value is divided by its scale and clipped
+# to [-1,1] (or [0,1] for magnitudes). Typical lamp blob motion is 0.5–2
+# px/frame; area/persistence rarely change faster than ~50%/s.
+VEL_SCALE   = 3.0     # px/frame mapped to ±1 for VX / VY / SPEED
+RATE_SCALE  = 0.5     # fractional change/s mapped to ±1 for D_AREA / D_PERSISTENCE
+ACCEL_SCALE = 0.3     # |ay| mapped to 1 for ACCEL
+
+
+# ── Curves (shape applied to the source value before scaling) ────────────────
+class Curve(str, Enum):
+    LIN    = "LIN"
+    LOG    = "LOG"
+    EXP    = "EXP"
+    SCURVE = "SCURVE"
+    SQRT   = "SQRT"
+
+
+def _lin(x: float)    -> float: return x
+def _log(x: float)    -> float:
+    x = max(min(x, 1.0), 0.0)
+    return math.log1p(9.0 * x) / math.log(10.0)        # 0..1 → 0..1, log shape
+def _exp(x: float)    -> float:
+    x = max(min(x, 1.0), 0.0)
+    return (math.exp(x) - 1.0) / (math.e - 1.0)        # 0..1 → 0..1, exp shape
+def _scurve(x: float) -> float:
+    x = max(min(x, 1.0), 0.0)
+    return x * x * (3.0 - 2.0 * x)                     # smoothstep
+def _sqrt(x: float)   -> float:
+    return math.sqrt(max(min(x, 1.0), 0.0))
+
+
+CURVE_FUNCS: dict[Curve, Callable[[float], float]] = {
+    Curve.LIN:    _lin,
+    Curve.LOG:    _log,
+    Curve.EXP:    _exp,
+    Curve.SCURVE: _scurve,
+    Curve.SQRT:   _sqrt,
+}
+
+
+def apply_curve(curve: Curve, x: float) -> float:
+    """
+    Apply curve to value. Negative inputs (e.g. orientation in [-1,1]) are
+    handled by curving the absolute value and re-applying sign, so curves
+    behave symmetrically around zero where it matters.
+    """
+    f = CURVE_FUNCS[curve]
+    if x >= 0:
+        return f(x)
+    return -f(-x)
+
+
+# ── Routing tuple ────────────────────────────────────────────────────────────
+@dataclass
+class Routing:
+    """
+    A single (source -> destination) modulation entry on a voice slot.
+
+    Fields:
+        src      Source enum value
+        dest     Dest enum value
+        depth    scalar amount, in dest's units (semitones / Hz / 0..1 / sec)
+                 Sign matters: +24 raises pitch with rising blob; -24 inverts
+        curve   Curve enum value (default LIN)
+        smooth  per-routing smoothing alpha (0..1, larger = snappier).
+                 If None, VoiceManager uses default_routing_smoothing.
+    """
+    src:    Source
+    dest:   Dest
+    depth:  float
+    curve:  Curve   = Curve.LIN
+    smooth: Optional[float] = None
+
+
+@dataclass
+class EventRoute:
+    """
+    A discrete-event mapping. Triggered when the source event fires on
+    the bound blob (e.g. direction_change). Handler is named so VoiceManager
+    can dispatch to the right method.
+    """
+    src:     str    # 'direction_change', 'merge', 'split'
+    handler: str    # 'attack_release_preset', 'pitch_glide', etc.
+
+
+# ── Default routings on BLOB_ONLY voices ───────────────────────────────────
+# v3.2: hue→wave_pos was replaced with a kinematic+geometric pair.
+#       y_norm        -> pitch        (depth +24 semitones)
+#       persistence   -> amp          (curve SQRT, depth +0.30)
+#       vy            -> wave_pos     (depth +0.4, LIN)   — kinematic
+#       area          -> wave_pos     (depth +0.4, SQRT)  — geometric
+#       elongation    -> res          (depth +0.6)
+#       orientation   -> pan          (depth +1.0)
+#       direction_change -> attack/release preset (event)
+# ── Default routings on BLOB_ONLY voices ───────────────────────────────────
+# v4.1: the kinematic + geometric base set is extended with motion- and
+# change-of-state mappings so a voice tracks not just *where* a blob is but
+# *how it is moving and changing shape/topology*. The aesthetic logic:
+#
+#   rising (vy<0)        → filter opens / brightens   (VY → FMODE, -)
+#   speed (|v|)          → brighter + wider/detuned    (SPEED → CUTOFF, DETUNE)
+#   elongation (stretch) → resonance + beating         (ELONGATION → RES, DETUNE)
+#   expanding (d_area>0) → swells louder + richer/folded(D_AREA → AMP, DRIVE)
+#   dissolving (d_pers<0)→ breath / air enters          (D_PERSISTENCE → NOISE, -)
+#   turning / accel      → vibrato + tremolo shimmer    (ACCEL → SHIMMER)
+#
+# Signs are chosen against each source's normalisation convention (image y:
+# vy<0 = rising; d_* > 0 = growing). apply_curve() preserves sign for the
+# signed sources, and VoiceManager clips every destination to its legal range,
+# so e.g. a contracting blob simply contributes 0 drive rather than negative.
+DEFAULT_BLOB_ROUTING: list[Routing] = [
+    # — v3.2 base set (position / topology / geometry) —
+    Routing(src=Source.Y_NORM,        dest=Dest.PITCH,    depth=+24.0, curve=Curve.LIN),
+    Routing(src=Source.PERSISTENCE,   dest=Dest.AMP,      depth=+0.30, curve=Curve.SQRT),
+    Routing(src=Source.VY,            dest=Dest.WAVE_POS, depth=+0.50, curve=Curve.LIN),
+    Routing(src=Source.AREA,          dest=Dest.WAVE_POS, depth=+0.40, curve=Curve.SQRT),
+    Routing(src=Source.ELONGATION,    dest=Dest.RES,      depth=+0.60, curve=Curve.LIN),
+    Routing(src=Source.ORIENTATION,   dest=Dest.PAN,      depth=+1.00, curve=Curve.LIN),
+    # — v4.1 motion / change-of-state set —
+    Routing(src=Source.SPEED,         dest=Dest.CUTOFF,   depth=+1800.0, curve=Curve.SQRT),
+    Routing(src=Source.SPEED,         dest=Dest.DETUNE,   depth=+0.35, curve=Curve.LIN),
+    Routing(src=Source.ELONGATION,    dest=Dest.DETUNE,   depth=+0.45, curve=Curve.SCURVE),
+    Routing(src=Source.D_AREA,        dest=Dest.DRIVE,    depth=+0.60, curve=Curve.LIN),
+    Routing(src=Source.D_AREA,        dest=Dest.AMP,      depth=+0.12, curve=Curve.LIN),
+    Routing(src=Source.D_PERSISTENCE, dest=Dest.NOISE,    depth=-0.60, curve=Curve.LIN),
+    Routing(src=Source.ACCEL,         dest=Dest.SHIMMER,  depth=+0.70, curve=Curve.SQRT),
+    Routing(src=Source.VY,            dest=Dest.FMODE,    depth=-0.70, curve=Curve.LIN),
+]
+
+DEFAULT_BLOB_EVENTS: list[EventRoute] = [
+    EventRoute(src="direction_change", handler="attack_release_preset"),
+]
+
+
+# ── Source-value extraction from a TrackedBlob ───────────────────────────────
+def extract_source_value(src: Source, blob, profile, *, age_norm_max: int = 600) -> float:
+    """
+    Read a normalised source value from a TrackedBlob.
+
+    Returns:
+        float in [0..1] for unsigned sources (Y_NORM, X_NORM, PERSISTENCE,
+        AREA, MEAN_HUE, ELONGATION, AGE) or [-1..1] for signed sources
+        (VY, ORIENTATION).
+
+    Notes:
+        - Y_NORM is inverted vs raw image: y_norm=1 means top of the lamp.
+        - persistence is divided by expected_persistence_mean * 4 as a
+          working ceiling; clipped to [0,1].
+        - area is divided by blob_area_max (from profile) and clipped.
+        - mean_hue is divided by 180 (OpenCV H range).
+        - orientation is in radians [-pi/2, pi/2]; mapped to [-1, 1].
+        - age uses coast_frames + age (total observed frames) bounded.
+    """
+    if src is Source.Y_NORM:
+        return 1.0 - profile.y_norm(blob.centroid[1])
+    if src is Source.X_NORM:
+        return profile.x_norm(blob.centroid[0])
+    if src is Source.VY:
+        # Populated every frame by the tracker (blob.vy, px/frame). Falls back
+        # to the legacy _vy_hint attribute, then 0. Normalised + clipped.
+        vy = float(getattr(blob, "vy", getattr(blob, "_vy_hint", 0.0)))
+        return max(-1.0, min(vy / VEL_SCALE, 1.0))
+    if src is Source.PERSISTENCE:
+        ceiling = max(profile.expected_persistence_mean * 4.0, 1.0)
+        return max(0.0, min(blob.persistence / ceiling, 1.0))
+    if src is Source.AREA:
+        ceiling = max(getattr(profile, "blob_area_max", 80000.0), 1.0)
+        return max(0.0, min(blob.area / ceiling, 1.0))
+    if src is Source.MEAN_HUE:
+        return max(0.0, min(blob.mean_hue / 180.0, 1.0))
+    if src is Source.ELONGATION:
+        return max(0.0, min(blob.elongation, 1.0))
+    if src is Source.ORIENTATION:
+        # -pi/2 .. pi/2 -> -1 .. 1
+        return max(-1.0, min(blob.orientation / (math.pi / 2.0), 1.0))
+    if src is Source.AGE:
+        a = getattr(blob, "age", 0)
+        return max(0.0, min(a / float(age_norm_max), 1.0))
+    # ── v4.1 motion / change-of-state sources ───────────────────────────
+    if src is Source.VX:
+        vx = float(getattr(blob, "vx", 0.0))
+        return max(-1.0, min(vx / VEL_SCALE, 1.0))
+    if src is Source.SPEED:
+        sp = float(getattr(blob, "speed", 0.0))
+        return max(0.0, min(sp / VEL_SCALE, 1.0))
+    if src is Source.D_AREA:
+        da = float(getattr(blob, "d_area", 0.0))
+        return max(-1.0, min(da / RATE_SCALE, 1.0))
+    if src is Source.D_PERSISTENCE:
+        dp = float(getattr(blob, "d_persistence", 0.0))
+        return max(-1.0, min(dp / RATE_SCALE, 1.0))
+    if src is Source.ACCEL:
+        ay = abs(float(getattr(blob, "ay", 0.0)))
+        return max(0.0, min(ay / ACCEL_SCALE, 1.0))
+    return 0.0
+
+
+# ── Helper: parse a routing string for command-line / config use ─────────────
+def parse_routing(spec: str) -> Routing:
+    """
+    Parse 'y_norm:pitch:24:LIN' into a Routing.
+    """
+    parts = spec.split(":")
+    if len(parts) < 3:
+        raise ValueError(f"bad routing spec: {spec!r}")
+    src_s, dst_s, depth_s = parts[0], parts[1], parts[2]
+    curve = Curve(parts[3].upper()) if len(parts) >= 4 else Curve.LIN
+    return Routing(
+        src   = Source(src_s.lower()),
+        dest  = Dest(dst_s.lower()),
+        depth = float(depth_s),
+        curve = curve,
+    )

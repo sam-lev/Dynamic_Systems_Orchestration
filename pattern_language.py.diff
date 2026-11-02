@@ -1,0 +1,66 @@
+--- /mnt/user-data/outputs/v4_2_score_grammar/pattern_language.py	2026-09-01 21:55:59.758089000 +0000
++++ pattern_language.py	2026-09-02 05:28:26.984894324 +0000
+@@ -454,32 +454,43 @@
+         self.osc = osc_client
+         self.lookahead = float(lookahead_s)
+         self.synthdef = synthdef
+-        self._sent_until: Dict[int, float] = {}       # voice slot -> cycle position rendered up to
++        self._sent_until: Dict[int, float] = {}       # voice slot -> SECONDS rendered up to
+ 
+     def render(self, slot: int, pattern: FnPattern, clock, now_s: float,
+                degree_to_freq: Callable[[Optional[int]], float], amp: float = 0.3,
+                extra_params: Optional[Dict[str, float]] = None) -> List[Tuple[float, list]]:
+         """Return [(time_s, /s_new args)] for events in the look-ahead window
+-        (and send them if an OSC client is attached)."""
+-        c_now = clock.seconds_to_cycles(now_s)
+-        c_end = clock.seconds_to_cycles(now_s + self.lookahead)
+-        c_from = max(self._sent_until.get(slot, c_now), c_now)
+-        if c_end <= c_from:
++        (and send them if an OSC client is attached).
++
++        Progress is tracked in SECONDS, not cycles. ElasticClock.set_period
++        re-anchors t0 every frame to preserve beat phase, so cycle numbering
++        is not monotonic across frames -- a cycle-based marker races ahead and
++        then silences the layer permanently. Seconds are anchor-invariant.
++        """
++        t_from = max(self._sent_until.get(slot, now_s), now_s)
++        t_end = now_s + self.lookahead
++        if t_end <= t_from:
+             return []
++        c_from = clock.seconds_to_cycles(t_from)
++        c_end = clock.seconds_to_cycles(t_end)
++        if c_end < c_from:                       # period changed under us
++            c_from, c_end = c_end, c_from
+         out = []
+         for e in pattern.query(Span(c_from, c_end)):
+             if e.start < c_from:
+                 continue
+-            t_on = clock.cycles_to_seconds(e.start)
+-            t_on = clock.pull(t_on)
+-            dur = max(0.02, clock.cycles_to_seconds(e.end) - clock.cycles_to_seconds(e.start))
++            # Elastic pull can move an onset slightly earlier than the window
++            # start. Clamping rather than dropping matters: with a strong pull
++            # this silently discarded ~75% of all hits.
++            t_on = max(clock.pull(clock.cycles_to_seconds(e.start)), t_from)
++            dur = max(0.03, (clock.cycles_to_seconds(e.end) - clock.cycles_to_seconds(e.start)) * 0.9)
+             args = ["/s_new", self.synthdef, -1, 0, 0,
+                     "freq", float(degree_to_freq(e.degree)), "amp", float(amp * e.velocity),
+-                    "dur", float(dur)]
++                    "dur", float(dur), "vel", float(e.velocity)]
+             for k, v in (extra_params or {}).items():
+                 args += [k, float(v)]
+             out.append((t_on, args))
+-        self._sent_until[slot] = c_end
++        self._sent_until[slot] = t_end
+         if self.osc is not None and out:
+             try:
+                 from pythonosc import osc_bundle_builder, osc_message_builder
+@@ -492,7 +503,7 @@
+                     self.osc.send(b.build())
+             except Exception:
+                 pass
+-        return out
++        return sorted(out, key=lambda r: r[0])
+ 
+     def reset(self, slot: Optional[int] = None) -> None:
+         if slot is None:

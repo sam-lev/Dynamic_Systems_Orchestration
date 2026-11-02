@@ -1,0 +1,167 @@
+--- /mnt/user-data/outputs/v4_2_score_grammar/voice_manager.py	2026-09-01 21:56:00.073024000 +0000
++++ voice_manager.py	2026-09-02 00:22:05.503704826 +0000
+@@ -235,6 +235,12 @@
+ 
+     born_at:        float = 0.0
+     zombie_started: float = 0.0
++    # v4.3 bass-stutter episode bookkeeping. `bass_started` stamps entry so a
++    # single episode can be time-capped; `bass_exit_streak` counts consecutive
++    # frames failing the continue condition, so one noisy frame cannot cause a
++    # node teardown/respawn (which is audible as a click).
++    bass_started:     float = 0.0
++    bass_exit_streak: int   = 0
+     last_played_at: float = 0.0       # when the player last sent NOTE_ON here
+     last_direction: str   = TURNING   # for direction-change event detection
+     spawn_origin:   str   = "blob"    # 'blob' or 'keyboard'
+@@ -322,12 +328,23 @@
+         # blob is low in the lamp, moving downward, and expanding.  Hysteresis
+         # keeps the mode from chattering at the threshold.  Tune these live.
+         self.bass_y_on      = 0.30   # y_norm <= lower 30% of lamp
+-        self.bass_y_off     = 0.40
++        self.bass_y_off     = 0.35   # was 0.40
+         self.bass_vy_on     = 0.30   # px/frame downward; tracker uses vy > 0
+-        self.bass_vy_off    = 0.10
++        self.bass_vy_off    = 0.15   # was 0.10
+         self.bass_darea_on  = 0.05   # +5% area/sec
+-        self.bass_darea_off = -0.02
+-        self.bass_min_age   = 4      # frames; lets Kalman/rate estimates settle
++        self.bass_darea_off = 0.01   # was -0.02 (a steady blob never exited)
++        self.bass_min_age   = 15     # was 4; ~1s at 15fps, real blobs only
++
++        # Episode limits. `bass_max_secs` is the safety net: whatever the
++        # thresholds do on a given lamp, no single voice can drone past it.
++        # `bass_exit_frames` debounces the exit so threshold noise does not
++        # cause repeated respawns. `max_bass_voices` keeps the gesture a
++        # gesture -- with 10+ simultaneous blobs, an uncapped bass layer is
++        # a wall of sub-bass rather than an accent.
++        self.bass_max_secs    = 6.0
++        self.bass_exit_frames = 3
++        self.max_bass_voices  = 2
++        self.bass_retrigger_secs = 3.0   # cooldown before a slot may re-enter
+ 
+         # Pending merge fade-outs (slot_id -> blob_id) preserved from v3.x
+         self._pending_merge_release: dict[int, float] = {}
+@@ -430,7 +447,7 @@
+             return
+         v.state      = VoiceState.HYBRID
+         v.blob_id    = blob.id
+-        v.synth_kind = "mpe"
++        self._clear_bass_state(v)
+         v.routing    = list(DEFAULT_BLOB_ROUTING)
+         v.events     = list(DEFAULT_BLOB_EVENTS)
+         v.last_direction = blob.direction
+@@ -545,6 +562,11 @@
+                (now - v.zombie_started) > self.zombie_window:
+                 self._release(v.slot_id)
+ 
++    def _clear_bass_state(self, v: Voice) -> None:
++        v.synth_kind       = "mpe"
++        v.bass_started     = 0.0
++        v.bass_exit_streak = 0
++
+     def _release(self, slot_id: int) -> None:
+         """Return a slot to IDLE. Sends gate=0 to SC and clears state."""
+         v = self.voice(slot_id)
+@@ -815,7 +837,9 @@
+         )
+ 
+     def _bass_continue_condition(self, blob) -> bool:
+-        """Looser exit threshold so bass mode does not flicker."""
++        """Slightly looser than the entry test so bass mode does not flicker --
++        but strictly narrower than 'anything at all', which is what the old
++        thresholds amounted to."""
+         y_norm = self.profile.y_norm(blob.centroid[1])
+         vy = float(getattr(blob, "vy", 0.0))
+         d_area = float(getattr(blob, "d_area", 0.0))
+@@ -826,19 +850,59 @@
+             and d_area >= self.bass_darea_off
+         )
+ 
++    def bass_voice_count(self) -> int:
++        """Slots currently rendering as \bassStutter."""
++        return sum(1 for v in self.voices_by_slot if v.synth_kind == "bass")
++
+     def _update_bass_stutter_modes(self, by_id: dict) -> None:
+-        """Turn eligible existing BLOB_ONLY/HYBRID voices into bass stutters."""
++        """Turn eligible existing BLOB_ONLY/HYBRID voices into bass stutters.
++
++        Exit takes priority over entry so a freed slot can be reused in the
++        same frame, and so the voice cap is evaluated against a current count.
++        """
++        now = time.time()
++
++        # ── Exits first (debounced + time-capped) ────────────────────────
+         for v in self.voices_by_slot:
+-            if v.state not in (VoiceState.BLOB_ONLY, VoiceState.HYBRID):
++            if v.synth_kind != "bass":
+                 continue
+-            if v.blob_id is None or v.blob_id not in by_id:
++            blob = by_id.get(v.blob_id) if v.blob_id is not None else None
++
++            # Blob gone entirely: leave bass immediately.
++            if blob is None or v.state not in (VoiceState.BLOB_ONLY, VoiceState.HYBRID):
++                self._switch_to_mpe(v, blob)
+                 continue
+ 
+-            blob = by_id[v.blob_id]
+-            if v.synth_kind != "bass" and self._bass_start_condition(blob):
+-                self._switch_to_bass_stutter(v, blob)
+-            elif v.synth_kind == "bass" and not self._bass_continue_condition(blob):
++            # Hard ceiling on episode length, independent of the conditions.
++            if v.bass_started > 0.0 and (now - v.bass_started) >= self.bass_max_secs:
+                 self._switch_to_mpe(v, blob)
++                continue
++
++            if self._bass_continue_condition(blob):
++                v.bass_exit_streak = 0
++            else:
++                v.bass_exit_streak += 1
++                if v.bass_exit_streak >= self.bass_exit_frames:
++                    self._switch_to_mpe(v, blob)
++
++        # ── Entries, subject to the global cap and a per-slot cooldown ───
++        n_bass = self.bass_voice_count()
++        for v in self.voices_by_slot:
++            if n_bass >= self.max_bass_voices:
++                break
++            if v.state not in (VoiceState.BLOB_ONLY, VoiceState.HYBRID):
++                continue
++            if v.synth_kind == "bass":
++                continue
++            if v.blob_id is None or v.blob_id not in by_id:
++                continue
++            # Cooldown: a slot that just left bass must wait before re-entering,
++            # otherwise a blob hovering at the threshold respawns nodes forever.
++            if v.bass_started > 0.0 and (now - v.bass_started) < self.bass_retrigger_secs:
++                continue
++            if self._bass_start_condition(by_id[v.blob_id]):
++                self._switch_to_bass_stutter(v, by_id[v.blob_id])
++                n_bass += 1
+ 
+     def _gate_current_nodes(self, v: Voice) -> None:
+         """Release the slot's current SC nodes without clearing slot identity."""
+@@ -858,13 +922,21 @@
+     def _switch_to_bass_stutter(self, v: Voice, blob) -> None:
+         r"""Replace this slot's normal \mpeVoice node with \bassStutter."""
+         self._gate_current_nodes(v)
+-        v.synth_kind = "bass"
++        v.synth_kind       = "bass"
++        v.bass_started     = time.time()
++        v.bass_exit_streak = 0
+         self._send_bass_spawn(v, blob)
+ 
+     def _switch_to_mpe(self, v: Voice, blob=None) -> None:
+-        r"""Return this slot from \bassStutter to the normal \mpeVoice."""
++        r"""Return this slot from \bassStutter to the normal \mpeVoice.
++
++        `bass_started` is deliberately NOT cleared: it doubles as the start of
++        the re-trigger cooldown, so a blob oscillating around the threshold
++        cannot respawn nodes every few frames.
++        """
+         self._gate_current_nodes(v)
+-        v.synth_kind = "mpe"
++        v.synth_kind       = "mpe"
++        v.bass_exit_streak = 0
+         # Re-enter normal voice without firing a birth strike.
+         self._send_spawn(v, blob=blob, fire_strike=False, gate=1)
+ 

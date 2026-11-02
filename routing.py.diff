@@ -1,0 +1,27 @@
+--- /mnt/user-data/outputs/v4_2_score_grammar/routing.py	2026-09-01 21:56:00.062402000 +0000
++++ routing.py	2026-09-02 05:26:49.102145329 +0000
+@@ -212,6 +212,24 @@
+     Routing(src=Source.D_PERSISTENCE, dest=Dest.NOISE,    depth=-0.60, curve=Curve.LIN),
+     Routing(src=Source.ACCEL,         dest=Dest.SHIMMER,  depth=+0.70, curve=Curve.SQRT),
+     Routing(src=Source.VY,            dest=Dest.FMODE,    depth=-0.70, curve=Curve.LIN),
++    # — v4.4 governor set —
++    # Without these the governor computes tension, meter and prominence every
++    # frame and NOTHING listens: the eight governor Sources existed in the enum
++    # but appeared in no default routing, so the score-grammar layer was
++    # inaudible except for the small additive layer in _compute_targets.
++    # BEAT_PHASE is the important one for a sense of pulse in the SUSTAINED
++    # voices -- it gives amplitude and brightness a periodic accent even before
++    # the gated \mpeHit pattern layer is running.
++    Routing(src=Source.BEAT_PHASE,      dest=Dest.AMP,     depth=-0.28, curve=Curve.SCURVE),
++    Routing(src=Source.BEAT_PHASE,      dest=Dest.CUTOFF,  depth=-1400.0, curve=Curve.SCURVE),
++    Routing(src=Source.TENSION,         dest=Dest.DRIVE,   depth=+0.55, curve=Curve.LIN),
++    Routing(src=Source.TENSION,         dest=Dest.CUTOFF,  depth=+2200.0, curve=Curve.SQRT),
++    Routing(src=Source.SURPRISAL,       dest=Dest.SHIMMER, depth=+0.60, curve=Curve.SQRT),
++    Routing(src=Source.PROMINENCE_RANK, dest=Dest.AMP,     depth=+0.35, curve=Curve.SQRT),
++    Routing(src=Source.PROMINENCE_RANK, dest=Dest.CUTOFF,  depth=+1500.0, curve=Curve.LIN),
++    Routing(src=Source.PHRASE_POSITION, dest=Dest.WAVE_POS, depth=+0.45, curve=Curve.LIN),
++    Routing(src=Source.DEPTH,           dest=Dest.PITCH,   depth=+12.0, curve=Curve.LIN),
++    Routing(src=Source.AMBIGUITY,       dest=Dest.NOISE,   depth=+0.40, curve=Curve.LIN),
+ ]
+ 
+ DEFAULT_BLOB_EVENTS: list[EventRoute] = [

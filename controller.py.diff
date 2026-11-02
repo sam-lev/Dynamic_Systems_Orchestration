@@ -1,0 +1,26 @@
+--- /mnt/user-data/outputs/v4_2_score_grammar/controller.py	2026-09-01 23:23:42.478400000 +0000
++++ controller.py	2026-09-02 03:02:57.408929372 +0000
+@@ -165,8 +165,8 @@
+     # v4.2: score-governor weights. These are GLOBAL (not per-slot); the
+     # param name is a dotted path into governor_weights.json and is routed
+     # to ScoreGovernor.handle_controller_event, never to VoiceManager.
+-    "gov":     ["gov.grouping.commit_threshold",
+-                "gov.grouping.switch_cost",
++    "gov":     ["gov.grouping.prior_phrase_secs",
++                "gov.grouping.evidence_rate",
+                 "gov.grouping.rules.saddle",
+                 "gov.grouping.rules.changepoint",
+                 "gov.grouping.rules.change",
+@@ -188,8 +188,10 @@
+     # v4.2 governor weights: rule weights and costs step by 0.1; bounded
+     # [0,1] parameters (thresholds, mixes, temperature, smoothing) by 0.02
+     # so a coarse press (x10) is still a sane 0.2 move.
+-    "gov.grouping.commit_threshold":        0.02,
+-    "gov.grouping.switch_cost":             0.1,
++    # v4.4: grouping has no threshold or switch cost. prior_phrase_secs is a
++    # DURATION in seconds, so it steps by 1 s fine / 10 s coarse.
++    "gov.grouping.prior_phrase_secs":       1.0,
++    "gov.grouping.evidence_rate":           0.002,
+     "gov.grouping.rules.saddle":            0.1,
+     "gov.grouping.rules.changepoint":       0.1,
+     "gov.grouping.rules.change":            0.1,

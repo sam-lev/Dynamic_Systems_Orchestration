@@ -1,0 +1,27 @@
+--- /mnt/user-data/outputs/v4_2_score_grammar/preference_rules.py	2026-09-01 21:55:59.736479000 +0000
++++ preference_rules.py	2026-09-02 05:49:59.931235210 +0000
+@@ -30,7 +30,7 @@
+ import math
+ import os
+ import time
+-from dataclasses import dataclass, field
++from dataclasses import dataclass, field, replace
+ from typing import Any, Callable, Dict, List, Optional, Sequence
+ 
+ import numpy as np
+@@ -62,7 +62,14 @@
+ 
+     @classmethod
+     def rules(cls, module: str) -> List[Rule]:
+-        return list(cls._rules.get(module, []))
++        """Return COPIES of the registered rules.
++
++        Returning the shared objects let every module instance mutate the same
++        Rule.weight: two governors (or two tests) would silently share weights,
++        and a live EDIT-surface change on one would move the other. The
++        registry holds the defaults; instances own their weights.
++        """
++        return [replace(r) for r in cls._rules.get(module, [])]
+ 
+     @classmethod
+     def modules(cls) -> List[str]:

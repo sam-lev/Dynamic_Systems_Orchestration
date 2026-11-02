@@ -1,0 +1,278 @@
+--- /mnt/user-data/outputs/v4_4_grouping/hazard_grouping.py	2026-09-02 03:07:15.501095000 +0000
++++ hazard_grouping.py	2026-09-02 05:57:52.883632123 +0000
+@@ -260,31 +260,74 @@
+     evidence: float = 0.0          # Phi(z)
+     z: float = 0.0
+     raw_score: float = 0.0
+-    strength: float = 0.0          # = p, graded boundary depth
++    strength: float = 0.0
+     depth: int = 0
++    n_hyp: int = 0                 # live segmentation hypotheses in the beam
++    committed_lag: float = 0.0     # how far back the committed boundary was
++
++
++@dataclass
++class Hypothesis:
++    """One segmentation hypothesis: 'the last boundary was at t0'.
++
++    `logp` is the accumulated log-likelihood of the whole segmentation path
++    that led here, so comparing hypotheses compares SEGMENTATIONS, not frames.
++    `parent` chains back through previous boundaries, which is what makes this
++    a Viterbi decode rather than a greedy per-frame choice.
++    """
++    t0: float
++    logp: float
++    parent: Optional["Hypothesis"] = field(default=None, repr=False)
++    depth_at_birth: int = 0
++    strength_at_birth: float = 0.0
+ 
+ 
+ class HazardGroupingModule:
+-    """Event-model grouping. Drop-in replacement for the Viterbi GroupingModule.
++    """Grouping as an online hidden semi-Markov model, decoded by beam Viterbi.
+ 
+-    Keeps the SAME registered rules (gap, change, saddle, changepoint, regime,
+-    relational, coincidence) and the same evidence dict, so nothing upstream
+-    changes. `regularity` is no longer needed -- the hazard represents phrase
+-    length directly -- and is ignored if still registered.
+-
+-    Only RELATIVE rule weights matter now: the standardiser absorbs the
+-    absolute scale, so doubling every weight changes nothing, and a brighter
+-    lamp does not need re-tuning.
++    The two requirements this reconciles:
+ 
+-    Deleted configuration: commit_threshold, switch_cost, forget, temperature,
+-    the 1.5 s refractory constant, and the regularity weight.
++      * A boundary is an EVENT. The per-frame boundary probability is
++        P = h(tau) * Phi(z): the Gamma hazard says whether we are DUE, the
++        z-scored evidence says whether something HAPPENED. Neither alone
++        fires. This is the emission/duration model.
++
++      * Structure is chosen by VITERBI over a BEAM. Rather than drawing a coin
++        each frame, the module carries K competing segmentation hypotheses --
++        each one an assertion about where the last boundary fell -- and scores
++        whole segmentation paths. Each frame every hypothesis may either
++        CONTINUE (accumulating log(1 - P)) or SPAWN a child that asserts a
++        boundary now (accumulating log P). The beam keeps the K best paths.
++        The committed boundary is read off the best path, so a boundary is
++        confirmed by what follows it, not only by the frame it occurred on.
++
++    Consequences of decoding rather than sampling:
++      * Boundary placement is REVISABLE within the beam's horizon: a
++        hypothesis that placed a boundary two seconds ago can be overtaken by
++        one that placed it now, and the reported segmentation improves.
++      * There is still no threshold and no refractory constant. The duration
++        model supplies both (hazard ~ 0 immediately after a boundary), and the
++        beam supplies hysteresis (a rival must out-score an incumbent PATH,
++        not merely a frame).
++      * Commitment is deterministic given the evidence -- reproducible runs,
++        which matters for the paper.
++
++    Deleted configuration is still deleted: commit_threshold, switch_cost,
++    forget, temperature, the 1.5 s refractory, the regularity rule. Added:
++    beam_size (structural, not a tuning knob) and commit_lag_secs, the delay
++    before a boundary is considered settled.
+     """
+ 
+     name = "grouping"
+-    IGNORED_RULES = ("regularity",)   # superseded by the hazard
++    IGNORED_RULES = ("regularity",)
++    # Bounds on the evidence likelihood ratio. Structural, not a tuning knob:
++    # they cap how far a single frame of evidence can move the decode, which
++    # is what keeps a sustained loud passage from firing a boundary per frame.
++    LR_MIN, LR_MAX = 0.05, 20.0
+ 
+     def __init__(self, weights: Optional[WeightStore] = None,
+-                 stochastic: bool = True, seed: int = 17):
++                 beam_size: int = 6, commit_lag_secs: float = 1.5,
++                 seed: int = 17, stochastic: bool = False):
+         self.weights = weights
+         self.rules: List[Rule] = [r for r in RuleRegistry.rules(self.name)
+                                   if r.name not in self.IGNORED_RULES]
+@@ -294,11 +337,14 @@
+         self.intervals = GammaIntervalModel(
+             prior_mean=self._w("prior_phrase_secs", GammaIntervalModel.PRIOR_MEAN_SECS))
+         self.evidence = RobustStandardiser(rate=self._w("evidence_rate", 0.01))
+-        self.stochastic = bool(stochastic)
++        self.beam_size = int(self._w("beam_size", beam_size))
++        self.commit_lag = float(self._w("commit_lag_secs", commit_lag_secs))
+         self.rng = np.random.default_rng(seed)
++        self.stochastic = bool(stochastic)      # legacy path, off by default
+ 
+-        self.last_boundary_t = 0.0
+         self.t = 0.0
++        self.beam: List[Hypothesis] = [Hypothesis(t0=0.0, logp=0.0)]
++        self.last_boundary_t = 0.0              # last COMMITTED boundary
+         self.n_boundaries = 0
+         self.last: BoundaryDecision = BoundaryDecision()
+ 
+@@ -316,53 +362,113 @@
+             self.intervals.prior_mean = float(value)
+         elif key == "evidence_rate":
+             self.evidence.rate = float(value)
++        elif key == "beam_size":
++            self.beam_size = max(2, int(value))
++        elif key == "commit_lag_secs":
++            self.commit_lag = float(value)
+         if self.weights:
+             self.weights.set(f"{self.name}.{key}", value)
+ 
+     # -- scoring -----------------------------------------------------------
+     def raw_score(self, evidence: Dict[str, Any]) -> float:
+-        """Weighted rule sum for the BOUNDARY hypothesis.
+-
+-        The rules are unchanged, so they still take a candidate argument; we
+-        pass the boundary candidate explicitly rather than comparing against a
+-        `continue` rival, because there is no rival in an event model.
+-        """
++        """Weighted rule sum for the boundary hypothesis. The rules are
++        unchanged; there is no `continue` rival to compare against in an event
++        model, so the boundary candidate is passed explicitly."""
+         cand = {"kind": "boundary"}
+         return sum(r.weight * r(evidence, cand) for r in self.rules)
+ 
++    def _p_boundary(self, tau: float, ev_p: float, dt: float) -> float:
++        return float(np.clip(self.intervals.hazard(tau, dt) * ev_p, 1e-9, 1.0 - 1e-9))
++
++    # -- decode ------------------------------------------------------------
+     def update(self, evidence: Dict[str, Any], dt: float) -> BoundaryDecision:
+         self.t += float(dt)
+-        tau = self.t - self.last_boundary_t
+ 
+         s = self.raw_score(evidence)
+         self.evidence.update(s)
+         z = self.evidence.z(s)
+         ev_p = _phi(z)
+-        hz = self.intervals.hazard(tau, dt)
+-        p = float(np.clip(hz * ev_p, 0.0, 1.0))
+-
+-        fired = (self.rng.random() < p) if self.stochastic else (p >= 0.5)
+ 
+-        d = BoundaryDecision(fired=fired, p=p, hazard=hz, evidence=ev_p, z=z,
+-                             raw_score=s, strength=p)
+-        if fired:
+-            # Graded depth from how strongly the two factors agreed. A high-z
+-            # boundary that is also well overdue is a section break; a
+-            # marginal one is motive-level articulation.
+-            if z > 2.0 and ev_p > 0.95:
+-                d.depth = 2
+-            elif z > 1.0:
+-                d.depth = 1
+-            else:
+-                d.depth = 0
+-            # strength is reported on the evidence scale rather than the raw
+-            # per-frame probability, which is tiny by construction (a phrase
+-            # is hundreds of frames long, so P must be small for the rate to
+-            # come out right). Consumers want "how strong was this boundary",
+-            # not "how likely was it this frame".
+-            d.strength = float(np.clip(0.5 * ev_p + 0.5 * min(1.0, max(z, 0.0) / 3.0), 0.0, 1.0))
+-            self.intervals.observe(tau)
+-            self.last_boundary_t = self.t
++        # Extend every hypothesis: continue, or spawn a boundary-now child.
++        #
++        # The per-frame boundary probability is a Bayes update. The hazard is
++        # the PRIOR odds that this segment ends now; the evidence contributes a
++        # LIKELIHOOD RATIO, ev/(1-ev), which is exactly 1 at the median (z = 0)
++        # and so is neutral by construction:
++        #
++        #     odds(boundary) = h(tau)/(1-h(tau)) * Phi(z)/(1-Phi(z))
++        #
++        # Two earlier formulations failed here, and both failures are
++        # instructive. Using only the duration term (spawn pays log h, continue
++        # pays log(1-h)) makes the never-boundary path always cheapest, so a
++        # boundary needed ~35 s of elapsed time to pay for itself whatever the
++        # evidence said. Adding a per-frame emission on both branches -- spawn
++        # log(Phi), continue log(1-Phi) -- overcorrected: a boundary is
++        # instantaneous but strong evidence PERSISTS for many frames, so a
++        # single loud frame drove log(1-Phi) toward -inf and forced boundaries
++        # at ~115/min. The odds form fixes both: evidence tilts the hazard
++        # rather than being re-observed as an independent event each frame, and
++        # clipping the ratio bounds how far one frame can move the decode.
++        eps = 1e-9
++        ev_c = float(np.clip(ev_p, 0.02, 0.98))
++        lr = float(np.clip(ev_c / (1.0 - ev_c), self.LR_MIN, self.LR_MAX))
++        nxt: List[Hypothesis] = []
++        best_p = 0.0
++        for h in self.beam:
++            tau = self.t - h.t0
++            hz = float(np.clip(self.intervals.hazard(tau, dt), eps, 1.0 - 1e-6))
++            odds = (hz / (1.0 - hz)) * lr
++            p = float(np.clip(odds / (1.0 + odds), eps, 1.0 - eps))
++            best_p = max(best_p, p)
++            nxt.append(Hypothesis(t0=h.t0, logp=h.logp + math.log1p(-p),
++                                  parent=h.parent,
++                                  depth_at_birth=h.depth_at_birth,
++                                  strength_at_birth=h.strength_at_birth))
++            strength = float(np.clip(0.5 * ev_p + 0.5 * min(1.0, max(z, 0.0) / 3.0), 0.0, 1.0))
++            depth = 2 if (z > 2.0 and ev_p > 0.95) else (1 if z > 1.0 else 0)
++            nxt.append(Hypothesis(t0=self.t, logp=h.logp + math.log(p), parent=h,
++                                  depth_at_birth=depth, strength_at_birth=strength))
++
++        # Prune: keep the K best paths, and only one hypothesis per boundary
++        # time (identical t0 with a worse score can never win later).
++        nxt.sort(key=lambda h: -h.logp)
++        seen, beam = set(), []
++        for h in nxt:
++            key = round(h.t0 / 0.25)   # 250 ms resolution: near-identical t0 is the same hypothesis
++            if key in seen:
++                continue
++            seen.add(key)
++            beam.append(h)
++            if len(beam) >= self.beam_size:
++                break
++        # Renormalise so logp does not drift to -inf over a long installation.
++        top = beam[0].logp
++        for h in beam:
++            h.logp -= top
++        self.beam = beam
++
++        # Commit: walk the best path back to the most recent boundary that is
++        # older than commit_lag. Boundaries younger than that are still open to
++        # revision by the beam, which is the point of decoding rather than
++        # sampling.
++        best = beam[0]
++        node, committed = best, None
++        while node is not None:
++            if node.t0 > 0.0 and (self.t - node.t0) >= self.commit_lag:
++                committed = node
++                break
++            node = node.parent
++        fired = False
++        d = BoundaryDecision(p=best_p, hazard=self.intervals.hazard(self.t - best.t0, dt),
++                             evidence=ev_p, z=z, raw_score=s, n_hyp=len(beam))
++        if committed is not None and committed.t0 > self.last_boundary_t + 1e-6:
++            fired = True
++            d.fired = True
++            d.strength = committed.strength_at_birth
++            d.depth = committed.depth_at_birth
++            d.committed_lag = self.t - committed.t0
++            self.intervals.observe(committed.t0 - self.last_boundary_t)
++            self.last_boundary_t = committed.t0
+             self.n_boundaries += 1
+ 
+         self.last = d
+@@ -373,6 +479,15 @@
+     def phrase_mean(self) -> float:
+         return self.intervals.mean
+ 
++    def segmentation(self, max_back: int = 8) -> List[float]:
++        """Boundary times on the current best path, most recent first."""
++        out, node = [], self.beam[0]
++        while node is not None and len(out) < max_back:
++            if node.t0 > 0.0:
++                out.append(round(node.t0, 2))
++            node = node.parent
++        return out
++
+     def state(self) -> Dict[str, Any]:
+         d = self.last
+         return {
+@@ -382,6 +497,8 @@
+             "z": round(d.z, 3),
+             "raw_score": round(d.raw_score, 3),
+             "n_boundaries": self.n_boundaries,
++            "beam": [{"t0": round(h.t0, 2), "logp": round(h.logp, 2)} for h in self.beam[:4]],
++            "segmentation": self.segmentation(),
+             "phrase_model": self.intervals.state(),
+             "evidence_model": self.evidence.state(),
+             "weights": {r.name: r.weight for r in self.rules},
