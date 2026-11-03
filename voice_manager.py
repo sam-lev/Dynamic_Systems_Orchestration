@@ -1,5 +1,6 @@
 # voice_manager.py -- Audible Lava / DSO v4.0 (MPE Edition)
 #
+# v4.9.3 (Oct 2026) -- ROOT_NOTE lowered an octave (48 -> 36); nothing else changed.
 # v4.9.2 (Oct 2026) -- recreate the default group after /g_freeAll 0 at startup.
 # v4.9.1 (Oct 2026) -- two slot-leak fixes in the release path:
 #
@@ -77,7 +78,7 @@ from routing        import (
 
 # ── Musical helpers (unchanged from v3.x) ────────────────────────────────────
 PENTATONIC   = [0, 2, 4, 7, 9]
-ROOT_NOTE    = 48     # C3
+ROOT_NOTE    = 36     # C2 (v4.9.3: was 48 / C3 -- lowered with routing's Y_NORM->PITCH depth)
 OCTAVE_RANGE = 3
 
 

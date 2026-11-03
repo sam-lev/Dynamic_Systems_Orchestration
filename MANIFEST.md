@@ -1,23 +1,163 @@
-# Audible Lava / DSO — v4.5 complete tree
+# Audible Lava / DSO — v4.9.4 complete tree
 
 Every script in the project at its most recent version. Files not listed as
 changed are byte-identical to the originals in the project folder.
 
-Verified in this directory: all 18 modules import cleanly, no syntax errors,
-and every test suite passes —
+Verified with the real governor stack (stubs only for `h0_persistence`,
+`lamp_profile`, SuperCollider, camera and pygame): every suite passes —
 
 | Suite | Result |
 |---|---|
-| `test_merge_tree.py` | 29 passed |
-| `test_hazard_grouping.py` | 26 passed |
+| `test_hazard_grouping.py` | 32 passed |
 | `test_score_grammar.py` | 21 passed |
-| `test_v43_fixes.py` | 23 passed |
-| `test_edit_rebase.py` (legacy) | 13 passed |
-| `test_voices.py` (legacy) | 35 passed |
+| `test_paired_voice.py` | 13 passed |
+| `claude/test_v493_changes.py` | 105 passed |
+| `claude/test_melody_rhythm.py` | 59 passed |
+| `claude/test_merge_release.py` | 21 passed |
+| `test_v49_wiring.py` | 23 passed |
+| `test_merge_tree.py`, `test_v43_fixes.py` | not re-run here (need the real `h0_persistence`); their modules are unchanged since v4.5 |
 
 ---
 
 ## Changed files
+
+### v4.9.4 (November 2026)
+
+**`audible_lava.py`** — pattern-layer hits leave as OSC bundles stamped with
+their due wall-clock time (`send_timed_hits`: `due = now + (t_on − governor.t)`,
+scsynth schedules them), instead of being sent the moment they were rendered
+up to one look-ahead window early. The hit layer's elastic pull is now
+audible. Falls back to immediate sends if the bundle classes are missing.
+
+**`hazard_grouping.py`, `score_governor.py`** — `prior_strength` 50 → 20
+(the prior keeps ~9 % of the weight at steady state instead of a fifth: a lamp
+that phrases at 12 s settles at ~13.2 s); `PERS_GATE_LO` 0.20 → 0.10 (a blob
+at a fifth of typical persistence now counts a third, one under a tenth still
+nothing).
+
+**The ascent whistle** (`routing.py`, `score_governor.py`, `voice_manager.py`)
+— some fast rising blobs produced a shrill tone climbing with speed. Three
+causes, all fixed: `VY → FMODE −0.70` morphed rising blobs toward high-pass
+(which removes the fundamental), while `SPEED → CUTOFF` and
+`ELONGATION → RES` on the same stretched, fast blob left a resonant peak
+sliding upward — "rising brightens" is now `VY → CUTOFF −900` (+900 Hz at
+full rise) and the mode is untouched; blobs the merge tree could not place
+were stamped at MAX depth so `DEPTH → PITCH +12` lifted every unmatched
+(small, fast, new) blob an octave — unknown depth is now 0; and
+`VoiceManager._compute_targets` caps resonance while the filter is in
+high-pass territory (`res_cap_hp` 0.45 at full high-pass, inactive at or
+below band-pass).
+
+**`melody_rhythm.py`** — `pull_mode` defaults to `"beat"` (onsets pulled
+toward beat lines, up to half a beat); `"clock"` remains available.
+
+**`governor_weights.json`** — all v4.9.3 keys added explicitly
+(`grouping.prior_strength`, `phrase_floor_secs`, `hazard_cap_per_sec`,
+`min_cue_age_secs`, `pers_tau_secs`, `count_tau_secs`, `rules.count_change`,
+`patterns.tau_secs`) alongside the existing hand-tuned values. Note the file's
+`prior_phrase_secs` is 9 s with an 8 s floor: the floor will bind almost
+immediately, so the learned mean can only move upward from 8 s.
+
+### Grouping feedback loop, pattern physics, melody couplings — v4.9.3
+
+The live symptom: the learned phrase mean collapsed to under a second, the
+hazard pinned at 1.0, ~2500 boundaries in 17 minutes, the schema flipping
+every ~0.4 s. Both halves of `P(boundary) = h(τ)·Φ(z)` were at their bad
+end — the duration model had learned nonsense and the evidence was loud all
+the time. The fix guards each half separately.
+
+**`hazard_grouping.py`** — duration half.
+`GammaIntervalModel` gains `mean_floor` (`phrase_floor_secs`, 8 s: the
+fitted mean never drops below it; while the floor binds the shape is capped at
+the prior's so the floored model keeps a refractory tail instead of becoming a
+wall at exactly 8 s), `hazard_cap_per_sec` (0.25: the per-frame probability is
+now the exact survival form `1 − exp(−min(h, h_max)·dt)`, so an overdue phrase
+fires with at most 25 % probability per second at neutral evidence; the old
+`clip(h·dt, 0, 1)` and the "far in the tail → 1.0" branch are gone),
+`PRIOR_STRENGTH` 2 → 50 pseudo-observations (20 since v4.9.4; the first
+boundaries cannot drag the mean down; with the 0.995 forgetting the
+observation count saturates at 200, so the prior keeps a share of the weight
+at steady state), and `reset()`.
+`HazardGroupingModule.reset_learning()` restores the prior live (fresh
+interval model and evidence null, beam and edited prior parameters kept).
+New weight keys `prior_strength`, `phrase_floor_secs`, `hazard_cap_per_sec`
+are live via `set_weight`. Also `REVISION_WINDOW_S` (1 s): the beam keeps one
+hypothesis per 250 ms bin, so two rival placements of the *same* boundary could
+both be committed when the best path switched between them — firing twice and
+teaching the interval model a 0.2 s "phrase"; a commit within a second of the
+previous one now moves the boundary instead of firing.
+
+**`score_governor.py`** — evidence half, plus the pattern layer.
+Lifecycle gate: a birth is never a cue; a death, merge (its retired blob) or
+split (its parent) counts only when that blob has been tracked for
+`min_cue_age_secs` (3 s). `ScoreState.events` still lists every event for the
+HUD; `ScoreState.cue_events` lists the ones that counted. Count evidence: each
+blob is weighted by an exponential moving average of its persistence (time
+constant `pers_tau_secs` 3 s, started at zero so a blob earns its weight)
+relative to the typical blob, the weighted sum is smoothed over
+`count_tau_secs` (2 s) into `ScoreState.count_smooth`, and a new
+`count_change` grouping rule reads its z-score (sigma floored at 0.15 blobs).
+That smoothed count also replaces the raw count in the macrostate symbol
+(`SystemStateTracker.update(count_override=…)`) and in the meter cardinality
+rule. `gov.grouping.reset_learning` is handled as an action. Pattern layer:
+`pattern_for_blob` takes its slot count `n` from the blob's own rise/fall
+period (beats per cycle, folded by octave division into 3..16 as the meter
+folds the tactus), one slot per beat, the cycle stretched to `n` beats
+(`("slow", n/beats_per_bar)`); hits `k = 1 + 3·area_n + 0.25·n` clamped to
+`2..n`, so density per beat falls as the cycle lengthens — a slow blob gets a
+long sparse cycle, a fast one a short busy one; elongation becomes swing
+(`("swing", 0.35·elongation, n)`); area, persistence, elongation and period
+are moving averages (`patterns.tau_secs` 3 s) so the rhythm cannot change
+frame to frame; rotation is fixed per blob instead of following beat phase.
+Ornamental hits occupy half their (now one-beat) slot (`orn_dur_scale`).
+
+**`elastic_clock.py`** — `set_period()` preserves BAR phase. It used to
+re-anchor bar 0 to the current beat, and the governor calls it every frame, so
+the bar never left its first beat: `beat_index` was always 0 (every beat read
+as the downbeat), and the hit layer could only ever render a pattern's opening
+slots — which, combined with a rotation that swept with beat phase, compressed
+a whole bar's pattern into every beat (the "busy hit layer"). Beat phase is
+preserved exactly as before.
+
+**`system_state.py`** — `count_override` keyword on `update()`/`symbolize()`;
+default behaviour unchanged.
+
+**`controller.py`** — `gov` family gains `gov.grouping.reset_learning`
+(select it, press `r` or an arrow; the HUD value is the reset count),
+`gov.grouping.phrase_floor_secs`, `gov.grouping.hazard_cap_per_sec`.
+
+**`melody_rhythm.py`** — `FieldScale`: a five-note scale from the governor's
+pitch field (the triad) plus the two diatonic neighbour degrees the current
+schema's melody contour uses most (2, 4, 6 or 7 of the triad's own major or
+minor mode; C major + the default neighbours 2, 6 is exactly the old C
+pentatonic, which is also what plays with the governor off). The root is the
+triad root placed within half an octave of `PitchParams.root`, which is now a
+register. A one-beat latch applies a new scale only when `beat_phase` wraps.
+Onset pull: a note that fires at governor time `t` is held until
+`clock.pull(t)` with the elastic strength the governor sets from the Kuramoto
+order parameter (`pull_mode="clock"` = subdivision grid as `clock.pull` does,
+`"beat"` = beat lines); only delays are possible, so the pull is one-sided, and
+the note is released on the first frame at or after its time, frame-quantised
+like everything else. Top band lowered: `octave_range` 3 → 2 (C3–C5).
+
+**`routing.py`** — `Y_NORM → PITCH` +12 → +7. **`voice_manager.py`** —
+`ROOT_NOTE` 48 → 36 (C2), on top of the v4.9.1/v4.9.2 release-path fixes and
+default-group recreation.
+
+**`governor_weights.json`** — `_version` is deliberately NOT bumped, so a
+file without the new keys keeps working (they fall back to the module
+defaults); the Project copy carries them explicitly since v4.9.4.
+
+### v4.9 → v4.9.2 (October 2026, delivered as files)
+
+`routing.py` defaults restored (`Y_NORM → RES +24`, `ELONGATION → PITCH −30`
+reverted); warm-lamp background capture plumbed through `BlobDetector`;
+merge-tree wax mask computed on the ROI; `melody_rhythm.py` + `melody_hit.scd`
+(hazard-driven onsets, height-band pitch with hysteresis, beat-length
+durations); game bridge removed from `audible_lava.py`; `voice_manager.py`
+merge-slot leak and orphan guard, `/g_new 1` after `/g_freeAll 0`;
+`blob_synth.scd` wavetables actually filled (`sine1`, not `sine1Msg`; buffers
+allocated from 0).
 
 ### Detection / topology — v4.2
 
@@ -146,18 +286,24 @@ follows the code.
 
 ## Running
 
-1. Boot scsynth, evaluate `blob_synth.scd`, then `blob_synth_hits.scd`.
-2. `python audible_lava.py` — the governor and pattern layer are on by default.
+1. Boot scsynth, evaluate `blob_synth.scd`, then `blob_synth_hits.scd`, then
+   `melody_hit.scd`.
+2. `python audible_lava.py` — the governor, pattern layer and melody layer are
+   on by default (`--no-governor`, `--no-patterns`, `--no-melody`).
 3. EDIT mode → `g` for governor weights; arrows step, `=`/`-` coarse, `r` reset.
-4. Watch `governor_runtime.json`; hand-set values live in `governor_weights.json`
-   (`governor_weights_live.json` is a measured, more reactive alternative).
+   On `gov.grouping.reset_learning`, `r` restores the phrase prior live.
+4. Watch `governor_runtime.json` (`grouping.phrase_model` shows the fitted
+   mean, whether the floor is active, and the prior weight; `count_smooth`,
+   `count_z` and `n_cues_gated` show what the evidence gate is doing);
+   hand-set values live in `governor_weights.json`.
 
 ## Outstanding
 
 * **Detection churn is the limiting factor.** Logged runs showed ~418 blob IDs
-  in 198 s (mean lifetime ~5 s) for wax moving 0.5–2 px/frame. Three of six
-  time-span prominence terms and most per-blob periodicity estimates are starved
-  by this. Verify the GUDHI fix is deployed, re-calibrate `pers_thresh`,
+  in 198 s (mean lifetime ~5 s) for wax moving 0.5–2 px/frame. v4.9.3 stops
+  that churn from driving the grouping model, but three of six time-span
+  prominence terms and most per-blob periodicity estimates are still starved
+  by it. Verify the GUDHI fix is deployed, re-calibrate `pers_thresh`,
   re-capture the background warm, then tune tracker association.
 * **Two mechanism issues remain in the beam modules** (meter, harmony):
   the meter proposal step evicts the incumbent before Viterbi sees it, so

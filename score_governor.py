@@ -1,4 +1,4 @@
-# score_governor.py -- Audible Lava / DSO v4.2
+# score_governor.py -- Audible Lava / DSO v4.9.3
 # Topological score grammar: the governor layer.
 #
 # Reads (never writes): tracked blobs, the corrected merge tree, the H0
@@ -21,6 +21,36 @@
 # posteriors, so they too move gradually. Crossfades are a byproduct.
 #
 # All blobs generate AND all blobs govern (guideline 14).
+#
+# v4.9.3 -- the evidence half of the grouping feedback loop
+# ----------------------------------------------------------
+# hazard_grouping.py floors and caps the DURATION half. This file quietens
+# the EVIDENCE half, which in a live run was loud all the time because
+# detection flicker (1 s births and deaths at the threshold) was being read
+# as "something happened" every few frames:
+#
+#   * lifecycle gate     birth never counts as a cue; death / merge / split
+#                        count only when the blob that disappears (or the
+#                        split parent) has been tracked for min_cue_age_secs
+#                        (3 s). s.events still carries every event for the
+#                        HUD; s.cue_events carries the ones that counted.
+#   * count evidence     a new `count_change` rule reads a z-score of the
+#                        EFFECTIVE blob count: each blob weighted by the
+#                        exponential moving average of its persistence
+#                        (time constant pers_tau_secs = 3 s, started at 0 so
+#                        a blob earns its weight) relative to the typical
+#                        blob, then smoothed over count_tau_secs = 2 s. That
+#                        smoothed count also replaces the raw count in the
+#                        macrostate symbol and the meter cardinality rule.
+#   * pattern layer      pattern_for_blob now takes its slot count n from
+#                        the blob's own rise/fall period (beats per cycle,
+#                        folded by octaves into 3..16, one slot per beat,
+#                        the pattern cycle stretched to n beats), turns
+#                        elongation into swing, and smooths area / persistence
+#                        / elongation / period with a 3 s moving average so
+#                        the rhythm cannot flip frame to frame.
+#   * EDIT surface       gov.grouping.reset_learning restores the phrase
+#                        prior live (controller `g` family, `r` key).
 
 from __future__ import annotations
 
@@ -105,6 +135,11 @@ class ScoreState:
     # roles: blob id (or 'sys:<signal>') -> weight per role
     role_weights: Dict[str, Dict[str, float]] = field(default_factory=dict)
     events: List[str] = field(default_factory=list)
+    # v4.9.3: lifecycle events that passed the young-blob gate (the ones that
+    # counted as boundary cues this frame); `events` keeps every event.
+    cue_events: List[str] = field(default_factory=list)
+    # v4.9.3: persistence-weighted, time-smoothed blob count
+    count_smooth: float = 0.0
     summary: Optional[SystemSummary] = None
 
 
@@ -112,7 +147,7 @@ class ScoreState:
 # Evidence dict keys (all floats unless noted):
 #   t, dt, since_boundary, ke_z, occ_z, flux_z, coh_z, pairvar_z, collin_z, com_cross,
 #   bocpd_max, bocpd_ke, bocpd_occ, bocpd_flux, bocpd_pairvar, cond_entropy_z, wdiag_z,
-#   saddle_strength, blob_event (0/1), n_cues, phrase_mean_len, ...
+#   saddle_strength, blob_event (0/1), n_cues, phrase_mean_len, count_z (v4.9.3) ...
 
 @rule("grouping", 1.5, "GPR2 analog: long quiet since the last blob/system event, then an event.")
 def gap(ev, c):
@@ -151,6 +186,14 @@ def relational(ev, c):
 def coincidence(ev, c):
     v = min(1.0, max(0.0, (ev["n_cues"] - 1) / 3.0))
     return v if c["kind"] == "boundary" else 0.5
+
+@rule("grouping", 1.0, "v4.9.3 count change: z-score of the persistence-gated, 2 s-smoothed blob count. "
+                       "A blob that has been persistent for a while appearing or disappearing counts; "
+                       "detection flicker never averages high enough to register.")
+def count_change(ev, c):
+    z = abs(ev.get("count_z", 0.0))
+    v = min(1.0, max(0.0, (z - 1.0) / 3.0))
+    return v if c["kind"] == "boundary" else 1.0 - v
 
 @rule("grouping", 1.5, "SUPERSEDED in v4.4 by the learned Gamma hazard, which represents phrase length "
                        "directly. Left registered for reference; HazardGroupingModule.IGNORED_RULES drops it.")
@@ -321,11 +364,20 @@ DEFAULT_WEIGHTS: Dict[str, Any] = {
     # v4.4: grouping is an event model. commit_threshold / switch_cost /
     # forget / temperature / the 1.5 s refractory / the regularity weight are
     # all GONE -- the learned Gamma hazard and the robust standardiser replace
-    # them. `prior_phrase_secs` is the only musically-opinionated number left
-    # and it is a unit-bearing quantity that washes out after ~5 boundaries.
-    "grouping": {"prior_phrase_secs": 25.0, "evidence_rate": 0.01,
+    # them. `prior_phrase_secs` is the only musically-opinionated number left.
+    # v4.9.3: prior_strength (pseudo-observations), phrase_floor_secs (the
+    # learned mean never drops below it), hazard_cap_per_sec (max boundary
+    # probability per second at neutral evidence), min_cue_age_secs (lifecycle
+    # events from younger blobs are ignored), pers_tau_secs / count_tau_secs
+    # (persistence gate and blob-count smoothing time constants), and the
+    # count_change rule. _version is NOT bumped: an existing
+    # governor_weights.json keeps working and the new keys fall back to these
+    # defaults until it is edited.
+    "grouping": {"prior_phrase_secs": 25.0, "prior_strength": 20.0, "phrase_floor_secs": 8.0,
+                 "hazard_cap_per_sec": 0.25, "evidence_rate": 0.01,
+                 "min_cue_age_secs": 3.0, "pers_tau_secs": 3.0, "count_tau_secs": 2.0,
                  "rules": {"gap": 1.5, "change": 2.0, "saddle": 2.0, "changepoint": 2.5, "regime": 1.0,
-                           "relational": 1.0, "coincidence": 1.5}},
+                           "relational": 1.0, "coincidence": 1.5, "count_change": 1.0}},
     "meter": {"switch_cost": 3.0, "forget": 0.98, "temperature": 1.0, "pf_mix": 0.5,
               "rules": {"periodicity": 2.0, "london_prior": 1.0, "cardinality": 1.0, "ratio_evidence": 1.0}},
     "meter_pf": {"n_particles": 150, "rules": {"onset_alignment": 2.0, "pf_continuity": 1.0, "pf_london": 0.5}},
@@ -338,6 +390,8 @@ DEFAULT_WEIGHTS: Dict[str, Any] = {
                 "rules": {"parsimony": 2.0, "step_gate": 2.0, "direction": 1.5, "size_license": 1.0,
                           "content_fit": 1.0}},
     "bocpd": {"hazard": 0.0083, "signals": ["ke", "occupancy_entropy", "flux", "pair_dist_var", "coherence"]},
+    # v4.9.3 pattern-layer smoothing (seconds)
+    "patterns": {"tau_secs": 3.0},
 }
 
 
@@ -358,6 +412,19 @@ def write_default_weights(path: str = "governor_weights.json", overwrite: bool =
 
 
 class ScoreGovernor:
+    # v4.9.3 persistence gate: a blob's weight in the effective count is
+    # clip((pers_ema / typical_persistence - PERS_GATE_LO) / PERS_GATE_W, 0, 1):
+    # zero until its smoothed persistence reaches 10 % of the typical blob's,
+    # full from 40 % up. With the EMA started at zero and pers_tau_secs = 3 s
+    # a typical blob reaches full weight ~1.5 s after it appears; a 1 s
+    # flicker at typical persistence peaks at ~0.6, a dim one (under a tenth
+    # of typical) at 0. A faint but real blob at a fifth of typical counts a
+    # third.
+    PERS_GATE_LO = 0.10
+    PERS_GATE_W  = 0.30
+    PERS_REF_TAU = 30.0          # time constant of the "typical persistence" reference
+    COUNT_SD_MIN = 0.15          # floor on the count z-score's sigma (blobs)
+
     def __init__(self, roi_w: float, roi_h: float, weights_path: str = "governor_weights.json",
                  runtime_path: str = "governor_runtime.json", log_path: str = "governor_log.txt",
                  home: Triad = Triad(0, True), fps: float = 30.0, seed: int = 5):
@@ -417,6 +484,7 @@ class ScoreGovernor:
         self.pair_gain      = 0.55   # amplitude relative to pattern_gain
         self.pair_dur_scale = 0.42   # <0.5 leaves audible gaps between hits
         self.pair_slot_base = 10000  # scheduler key offset for the paired layer
+        self.orn_dur_scale  = 0.5    # v4.9.3: ornamental hit = half its (one-beat) slot
         self.pattern_root_pc = 0
         self._pattern_cache: Dict[int, tuple] = {}   # blob id -> (spec, pattern)
         self.sounding_pcs: List[int] = []
@@ -425,6 +493,17 @@ class ScoreGovernor:
         self.period_every = 6                              # periodicity analyses every N frames
         self._per_cache: Dict[str, Tuple[float, int]] = {}
         self.last_edit: Optional[Tuple[str, float]] = None      # for HUD / runtime JSON
+        # ── v4.9.3 evidence gating state ──────────────────────────────────
+        self.first_seen: Dict[int, float] = {}        # blob id -> governor time first tracked
+        self._last_seen: Dict[int, float] = {}        # blob id -> governor time last tracked
+        self._pers_ema: Dict[int, float] = {}         # blob id -> EMA of persistence (starts at 0)
+        self._pers_ref_all: Optional[float] = None    # slow EMA of the mean raw persistence
+        self.count_eff = 0.0                          # persistence-weighted count, this frame
+        self.count_smooth = 0.0                       # ... smoothed over count_tau_secs
+        self.last_count_z = 0.0
+        self.n_cues_gated = 0                         # lifecycle events dropped by the age gate
+        # ── v4.9.3 pattern-layer smoothing: blob id -> {area, pers, elong, period}
+        self._pat_ema: Dict[int, Dict[str, float]] = {}
 
     # -- utilities ----------------------------------------------------------
     def _z(self, name: str, v: float, alpha: float = 0.02, clip_sigma: float = 3.0) -> float:
@@ -433,6 +512,21 @@ class ScoreGovernor:
         instead of instantly inflating the variance and vanishing."""
         m, var = self._ema.get(name, (v, 1.0))
         sd = math.sqrt(var + 1e-9)
+        z = (v - m) / sd
+        r = max(-clip_sigma * sd, min(clip_sigma * sd, v - m))
+        m2 = m + alpha * r
+        var2 = var + alpha * (r * r - var)
+        self._ema[name] = (m2, max(var2, 1e-6))
+        return float(z)
+
+    def _z_floor(self, name: str, v: float, sd_min: float, alpha: float = 0.02,
+                 clip_sigma: float = 3.0) -> float:
+        """_z with a floor on sigma (v4.9.3). For a quantity that can sit
+        perfectly still for minutes (the smoothed blob count) the running
+        variance collapses toward its 1e-6 floor and any wobble reads as
+        many sigma; sd_min says how big a change is worth noticing."""
+        m, var = self._ema.get(name, (v, sd_min * sd_min))
+        sd = max(math.sqrt(var + 1e-9), sd_min)
         z = (v - m) / sd
         r = max(-clip_sigma * sd, min(clip_sigma * sd, v - m))
         m2 = m + alpha * r
@@ -596,6 +690,67 @@ class ScoreGovernor:
         self.last_tree_saddles = cur
         return depth_of, max_depth, saddle_strength, stats
 
+    # -- v4.9.3 evidence gating helpers ------------------------------------------
+    def blob_age(self, blob_id: int) -> float:
+        """Seconds (governor time) since the blob was first tracked; 0 if unknown."""
+        born = self.first_seen.get(blob_id)
+        return 0.0 if born is None else max(0.0, self.t - born)
+
+    def event_counts_as_cue(self, event) -> bool:
+        """Lifecycle gate. A birth is never a cue (a new blob is unproven).
+        A death counts when the dying blob is at least min_cue_age_secs old;
+        a merge when the RETIRED blob (event[1]) is; a split when the PARENT
+        (event[1]) is. The survivor of a merge is usually old, so gating on
+        it would let every flicker-into-big-blob merge through."""
+        try:
+            kind = event[0]
+        except Exception:
+            return False
+        if kind == "birth":
+            return False
+        if kind in ("death", "merge", "split"):
+            if len(event) < 2:
+                return False
+            min_age = self.weights.get("grouping.min_cue_age_secs",
+                                       DEFAULT_WEIGHTS["grouping"]["min_cue_age_secs"])
+            born = self.first_seen.get(event[1])
+            return born is not None and (self.t - born) >= min_age
+        return True
+
+    def _update_effective_count(self, blobs, dt: float) -> float:
+        """Persistence-gated effective blob count and its 2 s smoothing.
+        Each blob's persistence is averaged with time constant pers_tau_secs
+        from a start of ZERO, and compared with a slow reference (the mean
+        persistence of tracked blobs, time constant PERS_REF_TAU); the gate
+        turns that ratio into a weight in [0, 1]. Dead blobs drop out at
+        once, which is the point: a 1 s flicker never averages high."""
+        pers_tau = max(self.weights.get("grouping.pers_tau_secs",
+                                        DEFAULT_WEIGHTS["grouping"]["pers_tau_secs"]), 1e-3)
+        count_tau = max(self.weights.get("grouping.count_tau_secs",
+                                         DEFAULT_WEIGHTS["grouping"]["count_tau_secs"]), 1e-3)
+        a_p = min(1.0, dt / pers_tau)
+        raw = []
+        for b in blobs:
+            p = float(getattr(b, "persistence", 0.0))
+            raw.append(p)
+            e = self._pers_ema.get(b.id, 0.0)
+            self._pers_ema[b.id] = e + a_p * (p - e)
+        if raw:
+            m = float(sum(raw) / len(raw))
+            if self._pers_ref_all is None:
+                self._pers_ref_all = m
+            else:
+                self._pers_ref_all += min(1.0, dt / self.PERS_REF_TAU) * (m - self._pers_ref_all)
+        ref = max(self._pers_ref_all or 0.0, 1e-6)
+        w_sum = 0.0
+        for b in blobs:
+            r = self._pers_ema[b.id] / ref
+            w_sum += float(np.clip((r - self.PERS_GATE_LO) / self.PERS_GATE_W, 0.0, 1.0))
+        self.count_eff = w_sum
+        a_c = min(1.0, dt / count_tau)
+        self.count_smooth += a_c * (w_sum - self.count_smooth)
+        return self.count_smooth
+
     # -- main per-frame update -------------------------------------------------
     def update(self, blobs, dt: float, tracker_events: Sequence[tuple] = (),
                tree_root=None, leaves=None, diagram=None) -> ScoreState:
@@ -605,22 +760,38 @@ class ScoreGovernor:
         s = ScoreState(t=self.t, home=self.walker.home.name)
         st = self.state_tracker
 
+        # v4.9.3: blob ages (governor time) for the lifecycle gate
+        for b in blobs:
+            self.first_seen.setdefault(b.id, self.t)
+            self._last_seen[b.id] = self.t
+        if self._frame % 300 == 0:
+            for bid in [k for k, v in self._last_seen.items() if self.t - v > 30.0]:
+                self.first_seen.pop(bid, None)
+                self._last_seen.pop(bid, None)
+                self._pers_ema.pop(bid, None)
+        count_smooth = self._update_effective_count(blobs, dt)
+        s.count_smooth = float(count_smooth)
+
         depth_of, max_depth, saddle_strength, tstats = self._tree_features(tree_root, leaves, blobs)
-        summ = st.update(blobs, dt, diagram=diagram, tree_stats=tstats)
+        summ = st.update(blobs, dt, diagram=diagram, tree_stats=tstats, count_override=count_smooth)
         s.summary = summ
         s.kuramoto = summ.extra.get("rel_kuramoto", 0.0)
 
         # events
         ev_names = [e[0] for e in tracker_events]
+        # v4.9.3: only events from blobs older than min_cue_age_secs are cues
+        cue_events = [e[0] for e in tracker_events if self.event_counts_as_cue(e)]
+        self.n_cues_gated += len(ev_names) - len(cue_events)
         for b in blobs:                                 # turnaround onsets for meter evidence
             d = getattr(b, "direction", None)
             if self.prev_direction.get(b.id) not in (None, d):
                 self.onsets.append(self.t)
             self.prev_direction[b.id] = d
-        if ev_names:
+        if cue_events:
             self.last_event_t = self.t
-            self.hazard_stats["n_events"] += len(ev_names)
+            self.hazard_stats["n_events"] += len(cue_events)
         s.events = list(ev_names)
+        s.cue_events = list(cue_events)
 
         # z-scores and changepoints
         ke_log = math.log1p(summ.ke_total)               # scale-free activity level
@@ -631,6 +802,8 @@ class ScoreGovernor:
         pairvar_z = self._z("pairvar", summ.extra.get("rel_pair_dist_var", 0.0))
         ce_z = self._z("ce", summ.cond_entropy)
         wd_z = self._z("wdiag", summ.w_diagram)
+        count_z = self._z_floor("count", count_smooth, self.COUNT_SD_MIN)
+        self.last_count_z = count_z
         collin = summ.extra.get("rel_collinearity", 0.0)
         collin_event = 1.0 if collin > 0.9 and self._z("collin", collin) > 1.5 else 0.0
         com_y = summ.extra.get("rel_com_y", 0.0)
@@ -647,7 +820,8 @@ class ScoreGovernor:
         bocpd_max = max(bocpd_p.values()) if bocpd_p else 0.0
 
         cues = [abs(ke_z) > 2, abs(occ_z) > 2, abs(flux_z) > 2, bocpd_max > 0.3, saddle_strength > 0.2,
-                bool(ev_names), ce_z > 2, wd_z > 2, com_cross > 0, collin_event > 0]
+                bool(cue_events), ce_z > 2, wd_z > 2, com_cross > 0, collin_event > 0,
+                abs(count_z) > 2]
         n_cues = float(sum(cues))
 
         # -- grouping (v4.4 hazard x evidence event model) ------------------------
@@ -656,7 +830,8 @@ class ScoreGovernor:
                "ke_z": abs(ke_z), "occ_z": abs(occ_z), "flux_z": abs(flux_z), "coh_z": abs(coh_z),
                "pairvar_z": abs(pairvar_z), "collin_event": collin_event, "com_cross": com_cross,
                "bocpd_max": bocpd_max, "cond_entropy_z": ce_z, "wdiag_z": wd_z,
-               "saddle_strength": saddle_strength, "n_cues": n_cues}
+               "saddle_strength": saddle_strength, "n_cues": n_cues,
+               "count_z": count_z}
         d = self.grouping.update(gev, dt)
         # `boundary_posterior` now reports the EVIDENCE probability Phi(z) --
         # the per-frame P is tiny by construction (a phrase is hundreds of
@@ -669,7 +844,7 @@ class ScoreGovernor:
             s.boundary_depth = d.depth
             self.boundary_intervals.append(self.t - self.last_boundary_t)
             self.last_boundary_t = self.t
-            self.schema.bias_from_state(self.tension, summ.cond_entropy, ev_names + ["boundary"])
+            self.schema.bias_from_state(self.tension, summ.cond_entropy, cue_events + ["boundary"])
             s.schema = self.schema.next()
         else:
             s.schema = self.schema.current
@@ -711,8 +886,10 @@ class ScoreGovernor:
                 w_b = self.roles.get("meter", {}).get(str(bid), 0.2)
                 period_strength[round(p, 3)] = max(period_strength.get(round(p, 3), 0.0), 0.6 * (0.5 + w_b))
         cand_periods = sorted(period_strength, key=lambda p: -period_strength[p])[:3] or [self.clock.p.period_s]
+        # v4.9.3: the cardinality rule sees the smoothed, persistence-gated
+        # count (rounded), not the raw per-frame count.
         mev = {"candidate_periods": cand_periods, "period_strength": period_strength,
-               "blob_count": summ.blob_count, "period_ratio": per_ratio}
+               "blob_count": float(round(count_smooth)), "period_ratio": per_ratio}
         mc = self.meter.update(mev)
         beam_period = mc["period"] if mc else self.clock.p.period_s
         pev = {"onsets": [t for t in self.onsets if self.t - t < 8.0], "beam_period": beam_period}
@@ -821,6 +998,8 @@ class ScoreGovernor:
 
     def get_weight(self, path: str) -> float:
         """Current value of a dotted weight path (live module value wins)."""
+        if path == "grouping.reset_learning":          # v4.9.3: shows the reset count
+            return float(self.grouping.n_resets)
         mod, _, key = path.partition(".")
         target = self._module(mod)
         if target is not None and key:
@@ -835,6 +1014,10 @@ class ScoreGovernor:
 
     # bounds so a runaway EDIT press cannot wedge a module
     WEIGHT_BOUNDS = {"prior_phrase_secs": (3.0, 300.0), "evidence_rate": (0.001, 0.2),
+                     "prior_strength": (1.0, 1000.0), "phrase_floor_secs": (0.0, 60.0),
+                     "hazard_cap_per_sec": (0.01, 1.0), "min_cue_age_secs": (0.0, 30.0),
+                     "pers_tau_secs": (0.1, 30.0), "count_tau_secs": (0.1, 30.0),
+                     "tau_secs": (0.1, 30.0),
                      "switch_cost": (0.0, 10.0),
                      "forget": (0.5, 1.0), "temperature": (0.05, 5.0), "pf_mix": (0.0, 1.0),
                      "smoothing": (0.0, 0.999), "virtual_signal_bias": (0.0, 3.0),
@@ -848,6 +1031,8 @@ class ScoreGovernor:
           * absolute by default
           * a DELTA when extras['relative'] is set (the keyboard's arrow keys)
           * snap back to the hand-set default when extras['reset'] is set
+          * 'gov.grouping.reset_learning' (v4.9.3) is an ACTION, not a value:
+            any event addressed to it restores the phrase prior live.
         Returns True if consumed, so the event never reaches VoiceManager.
         """
         p = getattr(ev, "param", None)
@@ -856,6 +1041,12 @@ class ScoreGovernor:
         path = str(p)[4:]
         mod, _, key = path.partition(".")
         extras = getattr(ev, "extras", None) or {}
+
+        if path == "grouping.reset_learning":
+            self.grouping.reset_learning()
+            self.last_edit = (path, float(self.grouping.n_resets))
+            self.weights.maybe_write(self.runtime_state(), force=True)
+            return True
 
         if extras.get("reset"):
             value = self.default_weight(path)
@@ -885,6 +1076,8 @@ class ScoreGovernor:
             "triad": s.triad, "distance_home": s.distance_home, "schema": s.schema,
             "period_s": s.period_s, "beats_per_bar": s.beats_per_bar, "elastic": s.elastic,
             "meter_source": s.meter_source, "boundary_posterior": s.boundary_posterior,
+            "count_smooth": round(self.count_smooth, 3), "count_z": round(self.last_count_z, 3),
+            "n_cues_gated": self.n_cues_gated,
             "grouping": self.grouping.state(), "meter": self.meter.state(),
             "meter_pf": self.meter_pf.state(), "harmony": self.harmony.state(),
             "roles": {r: {k: round(v, 3) for k, v in w.items()} for r, w in self.roles.items()},
@@ -893,28 +1086,76 @@ class ScoreGovernor:
         }
 
     # -- pattern realization for a blob --------------------------------------------
+    def _pattern_features(self, blob) -> Dict[str, float]:
+        """v4.9.3: per-blob exponential moving averages (time constant
+        patterns.tau_secs, default 3 s) of the quantities the pattern is
+        built from, so a flickering persistence or area cannot change the
+        rhythm frame to frame. Started at the current raw value, so the
+        first call gives exactly what the raw value would."""
+        tau = max(self.weights.get("patterns.tau_secs", DEFAULT_WEIGHTS["patterns"]["tau_secs"]), 1e-3)
+        a = min(1.0, (1.0 / max(self.fps, 1.0)) / tau)
+        raw = {"area": float(getattr(blob, "area", 0.0)),
+               "pers": float(getattr(blob, "persistence", 0.0)),
+               "elong": float(np.clip(getattr(blob, "elongation", 0.0), 0.0, 1.0))}
+        ph, per = self.state_tracker.blob_phase_and_period(blob.id)
+        e = self._pat_ema.get(blob.id)
+        if e is None:
+            e = dict(raw)
+            e["period"] = float(per) if per > 0 else 0.0
+            self._pat_ema[blob.id] = e
+        else:
+            for k, v in raw.items():
+                e[k] += a * (v - e[k])
+            if per > 0:                      # only resolved periods move the estimate
+                e["period"] = per if e["period"] <= 0 else e["period"] + a * (per - e["period"])
+        return e
+
     def pattern_for_blob(self, blob, s: Optional[ScoreState] = None):
         """Blob-owned rhythmic pattern: E(k, n) parameterized by blob
-        properties, transformed by governor state (a serializable spec)."""
+        properties, transformed by governor state (a serializable spec).
+
+        v4.9.3:
+          * n (slots) = beats in one of the blob's own rise/fall cycles,
+            folded by octave division into 3..16 as the meter folds the
+            tactus; one slot per beat, and the pattern cycle is stretched
+            to n beats with ("slow", n / beats_per_bar). A slow blob gets a
+            long sparse cycle, a fast one a short busy one. Unresolved
+            period -> the old persistence-based slot count.
+          * k (hits) = 1 + 3 area_n + 0.25 n, clamped to 2..n: bigger
+            blobs strike more often; density per beat falls as n grows.
+          * elongation -> swing: a stretched blob delays its off-slot hits
+            by up to 0.35 of a slot (("swing", 0.35 elong, n)).
+          * area / persistence / elongation / period are moving averages
+            (see _pattern_features); rotation is fixed per blob (id mod n)
+            instead of following beat phase every frame.
+        """
         from pattern_language import euclid, apply_spec
         s = s or self.state
+        f = self._pattern_features(blob)
         # Normalised against RUNNING maxima, not fixed constants: a fixed
         # 20000 px divisor put typical 3000 px blobs at area_n = 0.15, i.e.
         # 2 hits per bar however dense the lamp was.
-        self._area_ref = max(getattr(self, "_area_ref", 1.0) * 0.999,
-                             float(getattr(blob, "area", 0.0)), 1500.0)
-        self._pers_ref = max(getattr(self, "_pers_ref", 1.0) * 0.999,
-                             float(getattr(blob, "persistence", 0.0)), 20.0)
-        area_n = min(1.0, float(getattr(blob, "area", 0.0)) / self._area_ref)
-        pers_n = min(1.0, float(getattr(blob, "persistence", 0.0)) / self._pers_ref)
-        n = int(4 + round(pers_n * 8))                       # 4..12 slots
-        k = int(max(2, round(0.25 * n + area_n * 0.6 * n)))   # 2..~0.85n hits
-        rot = int(round(s.beat_phase * n))
+        self._area_ref = max(getattr(self, "_area_ref", 1.0) * 0.999, f["area"], 1500.0)
+        self._pers_ref = max(getattr(self, "_pers_ref", 1.0) * 0.999, f["pers"], 20.0)
+        area_n = min(1.0, f["area"] / self._area_ref)
+        pers_n = min(1.0, f["pers"] / self._pers_ref)
+        bpb = max(1, int(s.beats_per_bar))
+        if f["period"] > 0.0 and s.period_s > 0.0:
+            beats = f["period"] / s.period_s
+            while beats > 16.0:
+                beats /= 2.0
+            n = int(np.clip(round(beats), 3, 16))
+        else:
+            n = int(np.clip(4 + round(pers_n * 8), 3, 16))     # legacy fallback
+        k = int(np.clip(round(1.0 + 3.0 * area_n + 0.25 * n), 2, n))
+        rot = int(blob.id) % n
         # Degrees are drawn from the current pitch field so hits are in key.
         degrees = [1, 3, 5, 8][: max(2, 1 + int(3 * s.tension))]
         spec = [("degrade", max(0.0, 0.55 - 0.55 * s.tension), blob.id),
                 ("arp", degrees),
-                ("velocity", 0.55 + 0.45 * s.prominence_rank.get(blob.id, 0.5))]
+                ("velocity", 0.55 + 0.45 * s.prominence_rank.get(blob.id, 0.5)),
+                ("swing", round(0.35 * f["elong"], 3), n),
+                ("slow", n / float(bpb))]
         if s.boundary:
             spec.append(("ply", 2))
         if s.tension > 0.7:
@@ -939,6 +1180,9 @@ class ScoreGovernor:
         now = self.t if now_s is None else float(now_s)
         s = self.state
         root_pc = s.pitch_field[0] if s.pitch_field else self.pattern_root_pc
+        alive = {b.id for b in blobs}
+        for bid in [k for k in self._pat_ema if k not in alive]:
+            self._pat_ema.pop(bid, None)
         out = []
         for b in blobs:
             slot = voice_of(b.id) if voice_of else 0
@@ -949,10 +1193,14 @@ class ScoreGovernor:
             # Ornamental voices (low rank) get the busier hit layer; heads keep
             # the sustained voice, which is the Schenkerian reading made audible.
             amp = self.pattern_gain * (0.45 + 0.55 * (1.0 - rank))
+            # v4.9.3: a slot is now a whole beat (was 1/4..1/12 of a bar), so
+            # the hit occupies half of it rather than 0.9 -- keeps the layer
+            # percussive instead of turning it legato.
             msgs = self.scheduler.render(
                 slot, pat, self.clock, now,
                 degree_to_freq=lambda d, _r=root_pc: degree_to_freq(d if d else 1, _r, 48),
                 amp=amp,
+                dur_scale=self.orn_dur_scale,
                 extra_params={"cutoff": 900.0 + 3500.0 * s.tension,
                               "drive": 0.1 + 0.5 * s.tension,
                               "noise": 0.03 + 0.25 * s.ambiguity,

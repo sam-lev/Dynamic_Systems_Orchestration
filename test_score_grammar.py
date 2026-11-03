@@ -363,7 +363,14 @@ def gv_edit_surface_and_pattern():
     assert g.runtime_state()["last_edit"].startswith("roles.temperature")
 
     pat, spec = g.pattern_for_blob(synth_blobs(0)[0])
-    assert len(pat.query(Span(0, 1))) >= 1 and spec[0][0] == "degrade"
+    names = [t[0] for t in spec]
+    assert spec[0][0] == "degrade" and "swing" in names and "slow" in names, names
+    # v4.9.3: one slot per beat, the cycle stretched to n beats -> query the
+    # whole stretched cycle, with degrade off (tension 1) so the count is exact
+    g.state.tension = 1.0
+    pat, spec = g.pattern_for_blob(synth_blobs(0)[0])
+    stretch = next(t[1] for t in spec if t[0] == "slow")
+    assert len(pat.query(Span(0, math.ceil(stretch)))) >= 2, "a blob's cycle must carry at least two hits"
 
 
 @test

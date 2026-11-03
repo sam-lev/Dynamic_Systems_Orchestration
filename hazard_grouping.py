@@ -1,4 +1,4 @@
-# hazard_grouping.py -- Audible Lava / DSO v4.4
+# hazard_grouping.py -- Audible Lava / DSO v4.9.3
 # Grouping as an EVENT model, not a state-selection problem.
 #
 # Why this replaces the Viterbi beam
@@ -51,7 +51,37 @@
 #
 # The only number carrying a musical opinion is the prior phrase length
 # (PRIOR_MEAN_SECS), which is a unit-bearing quantity you can reason about,
-# unlike a posterior threshold of 0.55. It washes out after ~5-6 boundaries.
+# unlike a posterior threshold of 0.55.
+#
+# v4.9.3 -- breaking the positive-feedback loop
+# ---------------------------------------------
+# In a live run the learned phrase mean collapsed to well under a second: a
+# noisy evidence stream fired a few boundaries close together, each short
+# interval dragged the fitted mean down, the hazard rose everywhere, more
+# boundaries fired, and the hazard pinned at 1.0 (~2500 boundaries in 17
+# minutes; the schema flipped every ~0.4 s). Four guards, all on the
+# duration half of the model:
+#
+#   * MEAN_FLOOR_SECS   the fitted mean is clamped to >= 8 s. Below the floor
+#                       the data are no longer believed about regularity
+#                       either: shape is capped at the prior shape, so the
+#                       floored distribution keeps a refractory tail rather
+#                       than becoming near-periodic at exactly the floor.
+#   * HAZARD_CAP_PER_SEC the hazard RATE is capped so that even an overdue
+#                       phrase fires with at most this probability per
+#                       second (0.25 -> 25 %/s at neutral evidence). The
+#                       per-frame probability is 1 - exp(-min(h, h_max) dt),
+#                       the exact survival form, instead of clip(h dt, 0, 1).
+#   * PRIOR_STRENGTH    2 -> 20 pseudo-observations. The first dozen
+#                       boundaries cannot drag the mean to the floor; the
+#                       prior still has half the weight after 20 observed
+#                       intervals and ~9 % of it at steady state (the
+#                       observation count saturates at 1/(1-forget) = 200).
+#   * reset()           restores the prior live; exposed on the EDIT surface
+#                       as gov.grouping.reset_learning (controller `r` key).
+#
+# The evidence half is gated in score_governor.py (young-blob lifecycle
+# events ignored, count changes smoothed and gated on persistence).
 
 from __future__ import annotations
 
@@ -68,7 +98,7 @@ from preference_rules import RuleRegistry, Rule, WeightStore
 # ── Online interval model ────────────────────────────────────────────────────
 
 class GammaIntervalModel:
-    """Online Gamma(k, theta) over inter-boundary intervals, with a weak prior.
+    """Online Gamma(k, theta) over inter-boundary intervals, with a prior.
 
     Gamma is the right family here: it is the standard renewal-process
     interval distribution, its hazard rises from ~0 (giving a refractory
@@ -77,20 +107,30 @@ class GammaIntervalModel:
 
     Fitted by moment matching on an EMA of the first two moments, so it tracks
     a piece whose phrase lengths drift rather than assuming stationarity.
+
+    v4.9.3: floored mean, capped hazard, stronger prior, reset(). See the
+    module header for why.
     """
 
-    # Weak prior: musically plausible phrase length, shape 4 so it is not
+    # Prior: musically plausible phrase length, shape 4 so it is not
     # exponential. Deliberately the ONLY musically-opinionated constant.
     PRIOR_MEAN_SECS = 25.0
     PRIOR_SHAPE     = 4.0
-    PRIOR_STRENGTH  = 2.0        # equivalent observation count
+    PRIOR_STRENGTH  = 20.0       # equivalent observation count (v4.9.3: was 2)
+    # Guards (v4.9.3)
+    MEAN_FLOOR_SECS     = 8.0    # fitted mean never drops below this
+    HAZARD_CAP_PER_SEC  = 0.25   # max P(boundary within 1 s) at neutral evidence
 
     def __init__(self, prior_mean: float = PRIOR_MEAN_SECS,
                  prior_shape: float = PRIOR_SHAPE,
-                 prior_strength: float = PRIOR_STRENGTH):
+                 prior_strength: float = PRIOR_STRENGTH,
+                 mean_floor: float = MEAN_FLOOR_SECS,
+                 hazard_cap_per_sec: float = HAZARD_CAP_PER_SEC):
         self.prior_mean  = float(prior_mean)
         self.prior_shape = float(prior_shape)
         self.n0          = float(prior_strength)
+        self.mean_floor  = float(mean_floor)
+        self.hazard_cap_per_sec = float(hazard_cap_per_sec)
         # Observations are accumulated SEPARATELY from the prior and blended by
         # a weight that decays with observation count. Folding the prior into
         # the running sums instead lets its variance (prior_mean^2/shape, which
@@ -102,21 +142,35 @@ class GammaIntervalModel:
         self._sum2 = 0.0
         self.intervals: Deque[float] = deque(maxlen=64)
 
+    def reset(self) -> None:
+        """Forget every observed interval; the prior alone is in force."""
+        self._n = self._sum = self._sum2 = 0.0
+        self.intervals.clear()
+
     @property
     def prior_var(self) -> float:
         return self.prior_mean ** 2 / max(self.prior_shape, 1e-6)
 
     @property
     def _prior_weight(self) -> float:
-        """Prior share of the estimate; -> 0 as observations accumulate."""
+        """Prior share of the estimate; -> n0/(n0 + n) as observations accumulate."""
         return self.n0 / (self.n0 + self._n)
 
     # -- fitted parameters -------------------------------------------------
     @property
-    def mean(self) -> float:
+    def raw_mean(self) -> float:
+        """Prior/observation blend BEFORE the floor (for introspection)."""
         w = self._prior_weight
         obs = self._sum / self._n if self._n > 0 else self.prior_mean
         return w * self.prior_mean + (1.0 - w) * obs
+
+    @property
+    def floor_active(self) -> bool:
+        return self.raw_mean < self.mean_floor
+
+    @property
+    def mean(self) -> float:
+        return max(self.raw_mean, self.mean_floor)
 
     @property
     def var(self) -> float:
@@ -130,12 +184,30 @@ class GammaIntervalModel:
 
     @property
     def shape(self) -> float:
-        """k = mean^2 / var. Large k = regular phrasing, k -> 1 = memoryless."""
-        return float(np.clip(self.mean ** 2 / self.var, 0.5, 50.0))
+        """k = mean^2 / var. Large k = regular phrasing, k -> 1 = memoryless.
+
+        When the floor is active the observed intervals are shorter than the
+        model is allowed to believe, so their (tiny) variance says nothing
+        about regularity at the floored mean: k is then capped at the prior
+        shape. Without the cap a run of 0.4 s intervals would turn the floored
+        model into a near-periodic Gamma(50) at exactly 8 s, i.e. a hazard
+        that is ~0 for 7 s and then a wall.
+        """
+        k = float(np.clip(self.mean ** 2 / self.var, 0.5, 50.0))
+        if self.floor_active:
+            k = min(k, self.prior_shape)
+        return k
 
     @property
     def scale(self) -> float:
         return self.mean / self.shape
+
+    @property
+    def hazard_rate_cap(self) -> float:
+        """Rate (per second) equivalent to hazard_cap_per_sec as a probability:
+        1 - exp(-rate) = cap  =>  rate = -ln(1 - cap)."""
+        c = float(np.clip(self.hazard_cap_per_sec, 1e-4, 1.0 - 1e-6))
+        return -math.log1p(-c)
 
     def observe(self, interval: float, forget: float = 0.995) -> None:
         """Record an inter-boundary interval. `forget` lets the estimate track
@@ -147,15 +219,12 @@ class GammaIntervalModel:
         self.intervals.append(iv)
 
     # -- hazard ------------------------------------------------------------
-    def hazard(self, tau: float, dt: float) -> float:
-        """Probability that a boundary is due in the next dt seconds, given
-        that none has occurred for tau seconds.
-
-        h(tau) = f(tau) / S(tau) for the fitted Gamma; multiplied by dt to
-        become a per-frame probability. Clipped to [0, 1].
-        """
+    def hazard_rate(self, tau: float) -> float:
+        """Instantaneous hazard f(tau)/S(tau) of the fitted Gamma, per second,
+        capped at hazard_rate_cap."""
         tau = float(max(tau, 0.0))
         k, th = self.shape, self.scale
+        cap = self.hazard_rate_cap
         if th <= 0.0:
             return 0.0
         try:
@@ -167,14 +236,30 @@ class GammaIntervalModel:
             pdf = (x ** (k - 1) * math.exp(-x)) / (th * math.gamma(k))
             sf = max(1.0 - _lower_gamma_reg(k, x), 1e-9)
         if sf <= 1e-9:
-            # Far into the tail: treat as certainly due.
-            return 1.0
-        h = pdf / sf                            # per second
-        return float(np.clip(h * max(dt, 0.0), 0.0, 1.0))
+            # Far into the tail: as due as the model is allowed to be.
+            return cap
+        return float(min(pdf / sf, cap))
+
+    def hazard(self, tau: float, dt: float) -> float:
+        """Probability that a boundary is due in the next dt seconds, given
+        that none has occurred for tau seconds.
+
+        p = 1 - exp(-h(tau) dt), h capped at hazard_rate_cap, so the
+        probability of a boundary within any one second never exceeds
+        hazard_cap_per_sec however overdue the phrase is.
+        """
+        h = self.hazard_rate(tau)
+        return float(np.clip(-math.expm1(-h * max(dt, 0.0)), 0.0, 1.0))
 
     def state(self) -> Dict[str, float]:
         return {"mean_secs": round(self.mean, 2), "shape": round(self.shape, 2),
-                "scale": round(self.scale, 2), "n_observed": len(self.intervals)}
+                "scale": round(self.scale, 2), "n_observed": len(self.intervals),
+                "raw_mean_secs": round(self.raw_mean, 2),
+                "floor_active": bool(self.floor_active),
+                "mean_floor_secs": round(self.mean_floor, 2),
+                "hazard_cap_per_sec": round(self.hazard_cap_per_sec, 3),
+                "prior_strength": round(self.n0, 1),
+                "prior_weight": round(self._prior_weight, 3)}
 
 
 def _lower_gamma_reg(k: float, x: float, terms: int = 200) -> float:
@@ -316,6 +401,10 @@ class HazardGroupingModule:
     forget, temperature, the 1.5 s refractory, the regularity rule. Added:
     beam_size (structural, not a tuning knob) and commit_lag_secs, the delay
     before a boundary is considered settled.
+
+    Weight keys (all under "grouping."): rules.<name>, prior_phrase_secs,
+    prior_strength, phrase_floor_secs, hazard_cap_per_sec, evidence_rate,
+    beam_size, commit_lag_secs. reset_learning() is the live restore.
     """
 
     name = "grouping"
@@ -324,6 +413,14 @@ class HazardGroupingModule:
     # they cap how far a single frame of evidence can move the decode, which
     # is what keeps a sustained loud passage from firing a boundary per frame.
     LR_MIN, LR_MAX = 0.05, 20.0
+    # v4.9.3. The beam keeps one hypothesis per 250 ms bin, so two rival
+    # PLACEMENTS of the same boundary can sit 0.1-0.9 s apart; when the best
+    # path later switches between them the old code committed both, i.e.
+    # fired twice and taught the interval model a 0.2 s "phrase". A commit
+    # this close to the previous one is a re-placement: the boundary time
+    # moves, nothing fires. Structural (the duration model makes a genuine
+    # second phrase inside one second all but impossible anyway).
+    REVISION_WINDOW_S = 1.0
 
     def __init__(self, weights: Optional[WeightStore] = None,
                  beam_size: int = 6, commit_lag_secs: float = 1.5,
@@ -334,8 +431,7 @@ class HazardGroupingModule:
         for r in self.rules:
             r.weight = self._w(f"rules.{r.name}", r.weight)
 
-        self.intervals = GammaIntervalModel(
-            prior_mean=self._w("prior_phrase_secs", GammaIntervalModel.PRIOR_MEAN_SECS))
+        self.intervals = self._new_interval_model()
         self.evidence = RobustStandardiser(rate=self._w("evidence_rate", 0.01))
         self.beam_size = int(self._w("beam_size", beam_size))
         self.commit_lag = float(self._w("commit_lag_secs", commit_lag_secs))
@@ -346,11 +442,20 @@ class HazardGroupingModule:
         self.beam: List[Hypothesis] = [Hypothesis(t0=0.0, logp=0.0)]
         self.last_boundary_t = 0.0              # last COMMITTED boundary
         self.n_boundaries = 0
+        self.n_revisions = 0                    # re-placements absorbed (v4.9.3)
+        self.n_resets = 0
         self.last: BoundaryDecision = BoundaryDecision()
 
     # weight helper (mirrors PreferenceRuleModule so the EDIT surface works)
     def _w(self, key: str, default: float) -> float:
         return self.weights.get(f"{self.name}.{key}", default) if self.weights else default
+
+    def _new_interval_model(self) -> GammaIntervalModel:
+        return GammaIntervalModel(
+            prior_mean=self._w("prior_phrase_secs", GammaIntervalModel.PRIOR_MEAN_SECS),
+            prior_strength=self._w("prior_strength", GammaIntervalModel.PRIOR_STRENGTH),
+            mean_floor=self._w("phrase_floor_secs", GammaIntervalModel.MEAN_FLOOR_SECS),
+            hazard_cap_per_sec=self._w("hazard_cap_per_sec", GammaIntervalModel.HAZARD_CAP_PER_SEC))
 
     def set_weight(self, key: str, value: float) -> None:
         if key.startswith("rules."):
@@ -360,6 +465,12 @@ class HazardGroupingModule:
                     r.weight = float(value)
         elif key == "prior_phrase_secs":
             self.intervals.prior_mean = float(value)
+        elif key == "prior_strength":
+            self.intervals.n0 = max(float(value), 1e-3)
+        elif key == "phrase_floor_secs":
+            self.intervals.mean_floor = max(float(value), 0.0)
+        elif key == "hazard_cap_per_sec":
+            self.intervals.hazard_cap_per_sec = float(np.clip(value, 1e-4, 1.0 - 1e-6))
         elif key == "evidence_rate":
             self.evidence.rate = float(value)
         elif key == "beam_size":
@@ -368,6 +479,21 @@ class HazardGroupingModule:
             self.commit_lag = float(value)
         if self.weights:
             self.weights.set(f"{self.name}.{key}", value)
+
+    def reset_learning(self) -> None:
+        """Restore the prior live (v4.9.3). Drops every observed interval and
+        the evidence null distribution, keeping the current prior parameters
+        (including anything edited on the EDIT surface) and the beam, so a
+        drifted model is put back without restarting Python."""
+        cur = self.intervals
+        fresh = self._new_interval_model()
+        # keep live edits that bypassed the weight store
+        fresh.prior_mean, fresh.prior_shape = cur.prior_mean, cur.prior_shape
+        fresh.n0, fresh.mean_floor = cur.n0, cur.mean_floor
+        fresh.hazard_cap_per_sec = cur.hazard_cap_per_sec
+        self.intervals = fresh
+        self.evidence = RobustStandardiser(rate=self.evidence.rate)
+        self.n_resets += 1
 
     # -- scoring -----------------------------------------------------------
     def raw_score(self, evidence: Dict[str, Any]) -> float:
@@ -462,14 +588,19 @@ class HazardGroupingModule:
         d = BoundaryDecision(p=best_p, hazard=self.intervals.hazard(self.t - best.t0, dt),
                              evidence=ev_p, z=z, raw_score=s, n_hyp=len(beam))
         if committed is not None and committed.t0 > self.last_boundary_t + 1e-6:
-            fired = True
-            d.fired = True
-            d.strength = committed.strength_at_birth
-            d.depth = committed.depth_at_birth
-            d.committed_lag = self.t - committed.t0
-            self.intervals.observe(committed.t0 - self.last_boundary_t)
-            self.last_boundary_t = committed.t0
-            self.n_boundaries += 1
+            if self.n_boundaries > 0 and (committed.t0 - self.last_boundary_t) < self.REVISION_WINDOW_S:
+                # re-placement of the boundary already committed (see REVISION_WINDOW_S)
+                self.last_boundary_t = committed.t0
+                self.n_revisions += 1
+            else:
+                fired = True
+                d.fired = True
+                d.strength = committed.strength_at_birth
+                d.depth = committed.depth_at_birth
+                d.committed_lag = self.t - committed.t0
+                self.intervals.observe(committed.t0 - self.last_boundary_t)
+                self.last_boundary_t = committed.t0
+                self.n_boundaries += 1
 
         self.last = d
         return d
@@ -497,6 +628,8 @@ class HazardGroupingModule:
             "z": round(d.z, 3),
             "raw_score": round(d.raw_score, 3),
             "n_boundaries": self.n_boundaries,
+            "n_revisions": self.n_revisions,
+            "n_resets": self.n_resets,
             "beam": [{"t0": round(h.t0, 2), "logp": round(h.logp, 2)} for h in self.beam[:4]],
             "segmentation": self.segmentation(),
             "phrase_model": self.intervals.state(),

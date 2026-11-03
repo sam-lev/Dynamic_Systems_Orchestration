@@ -31,7 +31,7 @@ def test_routing_defaults():
     print("[routing] v3.2 base set restored")
     from routing import DEFAULT_BLOB_ROUTING, Source, Dest
     r = {(x.src, x.dest): x.depth for x in DEFAULT_BLOB_ROUTING}
-    check(r.get((Source.Y_NORM, Dest.PITCH)) == 12.0, "Y_NORM -> PITCH +12")
+    check(r.get((Source.Y_NORM, Dest.PITCH)) == 7.0, "Y_NORM -> PITCH +7 (v4.9.3; was +12)")
     check(r.get((Source.ELONGATION, Dest.RES)) == 0.6, "ELONGATION -> RES +0.6")
     check((Source.Y_NORM, Dest.RES) not in r, "Y_NORM -> RES removed")
     check((Source.ELONGATION, Dest.PITCH) not in r, "ELONGATION -> PITCH removed")

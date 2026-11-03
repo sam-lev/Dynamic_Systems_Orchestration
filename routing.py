@@ -16,7 +16,7 @@
 #   - EventRoute handles discrete events (direction_change, merge, split).
 #
 # Default routings on BLOB_ONLY voices (v3.2 — hue-free):
-#       y_norm        -> pitch        (depth +24 semitones)
+#       y_norm        -> pitch        (depth +7 semitones, v4.9.3)
 #       persistence   -> amp          (curve SQRT, depth +0.30)
 #       vy            -> wave_pos     (depth +0.40, LIN)   — kinematic
 #       area          -> wave_pos     (depth +0.40, SQRT)  — geometric
@@ -36,15 +36,16 @@
 #                                  ~4% of lamp height, and PITCH no longer
 #                                  tracked height at all after spawn)
 #     ELONGATION -> PITCH -30.0   (a fully stretched blob dropped 2.5 octaves)
-# They are now Y_NORM -> PITCH +12 (v4.9.1; +24 restored in v4.9 proved too
-# high) and ELONGATION -> RES +0.6 as documented
+# They are now Y_NORM -> PITCH +7 (v4.9.3; +12 in v4.9.1, +24 restored in
+# v4.9 proved too high) and ELONGATION -> RES +0.6 as documented
 # above. Note that base_note is ALSO set from height at spawn
-# (voice_manager._init_voice_from_blob), so the sounding pitch is
-# spawn-height pitch + 24 * current height: a blob born at the bottom and
-# rising to the top climbs two octaves; a blob born at the top sits two
-# octaves above its spawn note. If that upper range is too high, lower the
-# depth here (e.g. +12) rather than removing the routing -- without it the
-# sustained voice's pitch is frozen at its birth height.
+# (voice_manager._init_voice_from_blob, ROOT_NOTE..ROOT_NOTE+36, and v4.9.3
+# lowered ROOT_NOTE from C3 to C2), so the sounding pitch is
+# spawn-height pitch + 7 * current height: a blob born at the bottom and
+# rising to the top climbs a fifth on top of its spawn note. If that upper
+# range is still too high, lower the depth here or ROOT_NOTE rather than
+# removing the routing -- without it the sustained voice's pitch is frozen
+# at its birth height.
 
 from __future__ import annotations
 import math
@@ -189,7 +190,7 @@ class EventRoute:
 
 # ── Default routings on BLOB_ONLY voices ───────────────────────────────────
 # v3.2: hue→wave_pos was replaced with a kinematic+geometric pair.
-#       y_norm        -> pitch        (depth +24 semitones)
+#       y_norm        -> pitch        (depth +7 semitones, v4.9.3)
 #       persistence   -> amp          (curve SQRT, depth +0.30)
 #       vy            -> wave_pos     (depth +0.4, LIN)   — kinematic
 #       area          -> wave_pos     (depth +0.4, SQRT)  — geometric
@@ -214,7 +215,7 @@ class EventRoute:
 # so e.g. a contracting blob simply contributes 0 drive rather than negative.
 DEFAULT_BLOB_ROUTING: list[Routing] = [
     # — v3.2 base set (position / topology / geometry) — restored v4.9
-    Routing(src=Source.Y_NORM,        dest=Dest.PITCH,    depth=+12.0, curve=Curve.LIN),  # v4.9.1: was +24 (too high on top of spawn-height base_note)
+    Routing(src=Source.Y_NORM,        dest=Dest.PITCH,    depth=+7.0,  curve=Curve.LIN),  # v4.9.3: was +12 (v4.9.1), +24 (v4.9); lowered with ROOT_NOTE
     Routing(src=Source.PERSISTENCE,   dest=Dest.AMP,      depth=+0.30, curve=Curve.SQRT),
     Routing(src=Source.VY,            dest=Dest.WAVE_POS, depth=+0.50, curve=Curve.LIN),
     Routing(src=Source.AREA,          dest=Dest.WAVE_POS, depth=+0.40, curve=Curve.SQRT),

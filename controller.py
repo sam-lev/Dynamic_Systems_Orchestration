@@ -9,6 +9,12 @@
 #
 # Phase 1 ships KeyboardController (pygame). Phase 2 will activate
 # MIDIController (mido) and the LearnMode workflow on the same protocol.
+#
+# v4.9.3: the `gov` EDIT family gains gov.grouping.reset_learning (an
+# ACTION: select it and press `r` -- or any arrow -- to restore the phrase
+# prior live; the HUD value shows how many resets have been done), plus the
+# two new duration guards gov.grouping.phrase_floor_secs and
+# gov.grouping.hazard_cap_per_sec.
 
 from __future__ import annotations
 import json
@@ -165,7 +171,12 @@ EDIT_FAMILIES: dict[str, list[str]] = {
     # v4.2: score-governor weights. These are GLOBAL (not per-slot); the
     # param name is a dotted path into governor_weights.json and is routed
     # to ScoreGovernor.handle_controller_event, never to VoiceManager.
+    # v4.9.3: reset_learning is an action (press `r` on it); phrase_floor_secs
+    # and hazard_cap_per_sec are the new duration-model guards.
     "gov":     ["gov.grouping.prior_phrase_secs",
+                "gov.grouping.reset_learning",
+                "gov.grouping.phrase_floor_secs",
+                "gov.grouping.hazard_cap_per_sec",
                 "gov.grouping.evidence_rate",
                 "gov.grouping.rules.saddle",
                 "gov.grouping.rules.changepoint",
@@ -190,7 +201,12 @@ EDIT_STEP_FINE = {
     # so a coarse press (x10) is still a sane 0.2 move.
     # v4.4: grouping has no threshold or switch cost. prior_phrase_secs is a
     # DURATION in seconds, so it steps by 1 s fine / 10 s coarse.
+    # v4.9.3: reset_learning's step is nominal (any event on it resets);
+    # phrase_floor_secs steps by 0.5 s, hazard_cap_per_sec by 0.01.
     "gov.grouping.prior_phrase_secs":       1.0,
+    "gov.grouping.reset_learning":          1.0,
+    "gov.grouping.phrase_floor_secs":       0.5,
+    "gov.grouping.hazard_cap_per_sec":      0.01,
     "gov.grouping.evidence_rate":           0.002,
     "gov.grouping.rules.saddle":            0.1,
     "gov.grouping.rules.changepoint":       0.1,

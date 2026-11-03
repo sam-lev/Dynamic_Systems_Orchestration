@@ -25,7 +25,8 @@
 #
 #   2. HEIGHT-BAND PITCH WITH HYSTERESIS + CONTOUR INERTIA  (BandPitch)
 #      The lamp is divided into n_bands = len(scale) * octave_range horizontal
-#      bands (15 for the pentatonic / 3-octave default). Each band maps to one
+#      bands (10 for the five-note scale / 2-octave default; v4.9.3 lowered
+#      the top band from three octaves to two). Each band maps to one
 #      scale degree. A blob's band only changes when its centroid leaves the
 #      current band by more than `hysteresis` band-heights, so jitter at a
 #      boundary cannot flicker the pitch. The band is an ATTRACTOR, not the
@@ -34,6 +35,34 @@
 #      and whose direction follows sign(vy) only after that sign has been
 #      held for `dwell_s` seconds (contour inertia). A direction reversal is a
 #      turning point and forces resolution onto the band.
+#
+#   v4.9.3 couplings to the score governor (both silently off when the
+#   governor is not running, i.e. voices.score_state is None):
+#
+#   3. SCALE FROM THE FIELD  (FieldScale + MelodyEngine)
+#      Each frame the engine reads voices.score_state.pitch_field (the
+#      Tonnetz walker's triad, root first) and .schema (the current frame in
+#      schema_lexicon.LEXICON) and derives a five-note scale: the three
+#      triad pitch classes plus the two diatonic neighbour degrees the
+#      schema's melody contour uses most (2, 4, 6 or 7 of the triad's own
+#      major or minor mode). The root is the triad root placed within half
+#      an octave of PitchParams.root, which thereby becomes a REGISTER rather
+#      than a fixed note. The scale is applied only on a beat boundary (a
+#      one-beat latch), so it never changes between a note's selection and
+#      its sounding. C major + the default neighbours (2, 6) gives exactly
+#      the old C pentatonic, which is also what plays with the governor off.
+#
+#   4. ONSET PULL  (MelodyEngine._pull_delay)
+#      A note that fires at governor time t is moved to
+#          t' = t + k * (grid(t) - t)
+#      by the governor's ElasticClock (clock.pull), with k the elastic
+#      strength the governor sets from the Kuramoto order parameter -- the
+#      same pull the pattern layer gets. Only delays are possible (an onset
+#      that is already past the nearest grid line sounds at once), so the
+#      pull is one-sided; the note is held in a small queue and sent on the
+#      first frame at or after t'. pull_mode "beat" (default) pulls toward
+#      beat lines, up to half a beat; "clock" uses the subdivision grid
+#      exactly as clock.pull does (at most ~90 ms, barely audible).
 #
 # Conventions used here (verified against the v4.1 files in the Project):
 #   - profile.y_norm(roi_y) returns 1 = top of lamp, 0 = bottom.
@@ -56,12 +85,95 @@ from routing import Source, extract_source_value
 # Mirror of voice_manager's musical constants. Imported lazily below so this
 # module (and its tests) can load without pythonosc / OpenCV present.
 _DEFAULT_SCALE        = [0, 2, 4, 7, 9]   # major pentatonic
-_DEFAULT_ROOT         = 48                # C3
-_DEFAULT_OCTAVE_RANGE = 3
+_DEFAULT_ROOT         = 48                # C3: the melody REGISTER (v4.9.3)
+_DEFAULT_OCTAVE_RANGE = 2                 # v4.9.3: was 3; top band C5 instead of C6
+
+_PC_NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 
 
 def midi_to_freq(n: float) -> float:
     return 440.0 * (2.0 ** ((n - 69) / 12.0))
+
+
+# ── 0. Scale from the harmonic field (v4.9.3) ────────────────────────────────
+class FieldScale:
+    """Five-note scale derived from the governor's pitch field and schema.
+
+    derive(pitch_field, schema_name) -> (root_pc, offsets) where offsets are
+    the five semitone offsets from the root, sorted, always starting at 0.
+    Returns None when the field has fewer than three pitch classes.
+
+    Triad = pitch_field[:3] (the TonnetzWalker emits root, third, fifth
+    first and appends added tones after). Quality from the third: a major
+    third selects the Ionian mode for the diatonic neighbours, a minor
+    third the Aeolian mode. The two neighbours are the non-chord degrees
+    (2, 4, 6, 7) that the schema's melody contour uses most often, ties and
+    gaps filled from NEIGHBOUR_PREF, so a schema that walks 6-5-4-3
+    (prinner) colours the field with 6 and 4, a cadence (3-2-7-1) with 2
+    and 7, and a sparse plateau falls back to 2 and 6 -- the pentatonic.
+    """
+
+    MAJOR = (0, 2, 4, 5, 7, 9, 11)
+    MINOR = (0, 2, 3, 5, 7, 8, 10)
+    CHORD_DEGREES  = (1, 3, 5)
+    NEIGHBOUR_PREF = (2, 6, 4, 7)
+
+    @classmethod
+    def schema_neighbours(cls, schema_name: Optional[str]) -> List[int]:
+        counts: Dict[int, int] = {}
+        try:
+            from schema_lexicon import LEXICON          # lazy: optional dependency
+            contour = LEXICON[schema_name].melody if schema_name in LEXICON else ()
+        except Exception:
+            contour = ()
+        for d in contour:
+            if d is None:
+                continue
+            dm = ((int(d) - 1) % 7) + 1                 # fold 8 -> 1, -1 -> 6 ...
+            if dm not in cls.CHORD_DEGREES:
+                counts[dm] = counts.get(dm, 0) + 1
+        ranked = sorted(counts, key=lambda d: (-counts[d], cls.NEIGHBOUR_PREF.index(d)
+                                               if d in cls.NEIGHBOUR_PREF else 9))
+        out = ranked[:2]
+        for d in cls.NEIGHBOUR_PREF:
+            if len(out) >= 2:
+                break
+            if d not in out:
+                out.append(d)
+        return out
+
+    @classmethod
+    def derive(cls, pitch_field, schema_name: Optional[str] = None):
+        try:
+            pcs = [int(p) % 12 for p in list(pitch_field)[:3]]
+        except Exception:
+            return None
+        if len(pcs) < 3:
+            return None
+        root = pcs[0]
+        third = (pcs[1] - root) % 12
+        mode = cls.MINOR if third == 3 else cls.MAJOR
+        offsets = {0, third if third in (3, 4) else 4, (pcs[2] - root) % 12 or 7}
+        for d in cls.schema_neighbours(schema_name):
+            offsets.add(mode[d - 1])
+        offs = sorted(offsets)[:5]
+        while len(offs) < 5:                            # degenerate field: pad from the mode
+            for o in mode:
+                if o not in offs:
+                    offs.append(o)
+                    break
+        return root, sorted(offs)
+
+    @staticmethod
+    def root_midi(root_pc: int, register: int) -> int:
+        """The root's MIDI note within half an octave of `register`
+        (-5..+6 semitones; a tritone away goes up)."""
+        return int(register + ((int(root_pc) - int(register) + 5) % 12) - 5)
+
+    @staticmethod
+    def name(root_pc: int, offsets) -> str:
+        return _PC_NAMES[int(root_pc) % 12] + ":" + "".join(_PC_NAMES[(root_pc + o) % 12] + " "
+                                                            for o in offsets).strip()
 
 
 # ── 1. Hazard-driven onsets ──────────────────────────────────────────────────
@@ -296,6 +408,7 @@ class NoteEvent:
     rel:      float
     t:        float
     beats:    float = 0.0        # metrical length in beats (0 = seconds-based fallback)
+    delay:    float = 0.0        # v4.9.3: seconds the onset was pulled toward the grid
 
 
 # ── Duration in beats (v4.9.1) ───────────────────────────────────────────────
@@ -327,6 +440,17 @@ class MelodyEngine:
 
     `send` can be overridden (tests pass a recorder) — default is
     voices.osc.send_message.
+
+    v4.9.3 keyword options:
+        field_scale   derive the scale from the governor's pitch field and
+                      schema (default True; C pentatonic when the governor
+                      is off or this is False)
+        onset_pull    pull onsets toward the governor's clock grid with the
+                      Kuramoto elastic strength (default True)
+        pull_mode     "beat" (default) = beat lines, "clock" = clock.pull
+                      (subdivision grid), both at the same strength
+        governor      explicit ScoreGovernor; default reads
+                      voices.score_governor, which audible_lava sets
     """
 
     def __init__(self, voices, profile, *,
@@ -340,7 +464,11 @@ class MelodyEngine:
                  seed: Optional[int] = None,
                  clock: Callable[[], float] = time.time,
                  beat_period: Optional[Callable[[], Optional[float]]] = None,
-                 min_dur: float = 0.15, max_dur: float = 8.0):
+                 min_dur: float = 0.15, max_dur: float = 8.0,
+                 field_scale: bool = True,
+                 onset_pull: bool = True,
+                 pull_mode: str = "beat",
+                 governor=None):
         self.voices   = voices
         self.profile  = profile
         self.synthdef = synthdef
@@ -359,6 +487,22 @@ class MelodyEngine:
         self.min_dur, self.max_dur = min_dur, max_dur
         self.last_events: List[NoteEvent] = []   # notes fired on the most recent frame
         self.total_notes = 0
+        # ── v4.9.3 scale-from-field (with one-beat latch) ────────────────
+        self.field_scale = bool(field_scale)
+        self.register    = int(self.pitch.p.root)          # PitchParams.root is the register
+        self.default_scale = list(self.pitch.p.scale)
+        self.scale_root_pc: Optional[int] = None           # None = default C pentatonic
+        self.scale_offsets: List[int] = list(self.default_scale)
+        self._pending_scale = None                         # (root_pc | None, offsets) awaiting a beat
+        self._prev_beat_phase: Optional[float] = None
+        self.scale_changes = 0
+        # ── v4.9.3 onset pull ────────────────────────────────────────────
+        self.onset_pull = bool(onset_pull)
+        self.pull_mode  = pull_mode
+        self._governor  = governor
+        self._queue: List[tuple] = []                      # (fire_at, blob, voice, slot, midi, delay)
+        self.total_pulled = 0
+        self.last_delay = 0.0
 
     def _default_beat_period(self) -> Optional[float]:
         ss = getattr(self.voices, "score_state", None)
@@ -369,10 +513,90 @@ class MelodyEngine:
             return None
         return p if 0.05 < p < 10.0 else None
 
+    def _score_state(self):
+        return getattr(self.voices, "score_state", None)
+
+    def _gov(self):
+        return self._governor if self._governor is not None else getattr(self.voices, "score_governor", None)
+
     # ── toggles ──────────────────────────────────────────────────────────
     def toggle(self) -> bool:
         self.enabled = not self.enabled
         return self.enabled
+
+    # ── v4.9.3 scale latch ───────────────────────────────────────────────
+    def _target_scale(self, ss):
+        """(root_pc | None, offsets) the field asks for; default when off."""
+        if ss is None or not self.field_scale:
+            return (None, list(self.default_scale))
+        field = getattr(ss, "pitch_field", None)
+        d = FieldScale.derive(field, getattr(ss, "schema", None)) if field else None
+        if d is None:
+            return (None, list(self.default_scale))
+        return (int(d[0]), list(d[1]))
+
+    def _apply_scale(self, target) -> None:
+        root_pc, offsets = target
+        self.scale_root_pc = root_pc
+        self.scale_offsets = list(offsets)
+        self.pitch.p.scale = list(offsets)
+        self.pitch.p.root  = (self.register if root_pc is None
+                              else FieldScale.root_midi(root_pc, self.register))
+        self.scale_changes += 1
+
+    def _update_scale(self, ss) -> None:
+        """Latch: a new target scale is applied on the next beat boundary
+        (beat_phase wrapping), immediately when there is no clock."""
+        target = self._target_scale(ss)
+        current = (self.scale_root_pc, self.scale_offsets)
+        if target != current:
+            self._pending_scale = target
+        elif self._pending_scale is not None and self._pending_scale == current:
+            self._pending_scale = None
+        bp = getattr(ss, "beat_phase", None) if ss is not None else None
+        try:
+            bp = None if bp is None else float(bp)
+        except (TypeError, ValueError):
+            bp = None
+        boundary = bp is None or (self._prev_beat_phase is not None and bp < self._prev_beat_phase)
+        self._prev_beat_phase = bp
+        if self._pending_scale is not None and boundary:
+            self._apply_scale(self._pending_scale)
+            self._pending_scale = None
+
+    # ── v4.9.3 onset pull ────────────────────────────────────────────────
+    def _pull_delay(self, ss) -> float:
+        """Seconds to hold a note that fires now so it lands where the
+        governor's elastic clock pulls it. 0 when the governor is off,
+        the pull is disabled, or the nearest grid line is already past."""
+        if not self.onset_pull or ss is None:
+            return 0.0
+        gov = self._gov()
+        clk = getattr(gov, "clock", None)
+        if clk is None:
+            return 0.0
+        try:
+            t_g = float(gov.t)                            # governor time, not wall time
+            if self.pull_mode == "beat":
+                step = float(clk.p.period_s)
+                grid = clk.t0 + round((t_g - clk.t0) / step) * step
+                k = float(clk.p.elastic)
+                t_p = t_g + k * (grid - t_g)
+            else:
+                t_p = float(clk.pull(t_g))
+        except Exception:
+            return 0.0
+        return max(0.0, t_p - t_g)
+
+    def _flush_queue(self, now: float) -> None:
+        due = [q for q in self._queue if q[0] <= now]
+        self._queue = [q for q in self._queue if q[0] > now]
+        for fire_at, blob, voice, slot_id, midi, delay in due:
+            if self.voices.slot_for_blob(blob.id) != slot_id:
+                continue                                   # blob gone / re-bound while held
+            ev = self._fire(blob, voice, slot_id, midi, now, delay=delay)
+            self.last_events.append(ev)
+            self.total_notes += 1
 
     # ── per-frame ────────────────────────────────────────────────────────
     def process_frame(self, tracked: list) -> List[NoteEvent]:
@@ -386,7 +610,12 @@ class MelodyEngine:
         self.pitch.prune(alive)
 
         if not self.enabled:
+            self._queue.clear()
             return self.last_events
+
+        ss = self._score_state()
+        self._update_scale(ss)
+        self._flush_queue(now)
 
         for b in tracked:
             slot_id = self.voices.slot_for_blob(b.id)
@@ -405,14 +634,21 @@ class MelodyEngine:
             if not self.hazard.step(b.id, speed_n, accel_n, dt, now):
                 continue
 
-            midi = self.pitch.next_midi(b.id, speed_n)
-            ev   = self._fire(b, v, slot_id, midi, now)
+            midi  = self.pitch.next_midi(b.id, speed_n)
+            delay = self._pull_delay(ss)
+            self.last_delay = delay
+            if delay > 0.012:                              # worth holding (> ~1/3 frame)
+                self._queue.append((now + delay, b, v, slot_id, midi, delay))
+                self.total_pulled += 1
+                continue
+            ev = self._fire(b, v, slot_id, midi, now)
             self.last_events.append(ev)
             self.total_notes += 1
         return self.last_events
 
     # ── note construction ────────────────────────────────────────────────
-    def _fire(self, blob, voice, slot_id: int, midi: int, now: float) -> NoteEvent:
+    def _fire(self, blob, voice, slot_id: int, midi: int, now: float,
+              delay: float = 0.0) -> NoteEvent:
         s       = voice.synth
         area_n  = extract_source_value(Source.AREA,   blob, self.profile)
         x_norm  = extract_source_value(Source.X_NORM, blob, self.profile)
@@ -453,13 +689,22 @@ class MelodyEngine:
         except Exception:
             pass
         return NoteEvent(blob_id=blob.id, slot_id=slot_id, midi=midi, freq=freq,
-                         amp=amp, pan=pan, dur=dur, rel=rel, t=now, beats=beats)
+                         amp=amp, pan=pan, dur=dur, rel=rel, t=now, beats=beats,
+                         delay=delay)
 
     # ── diagnostics for the overlay / HUD ────────────────────────────────
+    def scale_info(self) -> str:
+        """Current scale as 'root:pcs' plus the register root MIDI note."""
+        root_pc = self.scale_root_pc if self.scale_root_pc is not None else 0
+        tag = "field" if self.scale_root_pc is not None else "default"
+        return f"{FieldScale.name(root_pc, self.scale_offsets)} ({tag}, root m{self.pitch.p.root})"
+
     def hud_line(self) -> str:
         n_tracked = len(self.hazard._state)
         return (f"MELODY {'on ' if self.enabled else 'off'} "
-                f"blobs:{n_tracked} notes:{self.total_notes}")
+                f"blobs:{n_tracked} notes:{self.total_notes} "
+                f"pulled:{self.total_pulled} held:{len(self._queue)} "
+                f"scale:{self.scale_info()}")
 
     def blob_info(self, blob_id: int) -> str:
         hs = self.hazard.state(blob_id)

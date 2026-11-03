@@ -12,6 +12,9 @@
 # Hierarchy: bar > beat > subdivision. One pattern cycle = one bar.
 # London's perceptual bounds clamp everything: tactus 0.4-2.0 s, subdivision
 # >= 0.1 s, bar <= 6 s.
+#
+# v4.9.3: set_period() preserves BAR phase (and therefore beat phase) rather
+# than re-anchoring bar 0 to the current beat every call; see its docstring.
 
 from __future__ import annotations
 
@@ -57,11 +60,23 @@ class ElasticClock:
             p.accent = tuple([1.0] + [0.6 if i % 2 else 0.8 for i in range(1, p.beats_per_bar)])
 
     def set_period(self, period_s: float, now_s: float) -> None:
-        """Change tempo continuously: keep the current beat phase fixed."""
-        ph = self.beat_phase(now_s)
+        """Change tempo continuously: keep the current BAR phase fixed.
+
+        v4.9.3: previously this re-anchored t0 to the start of the current
+        BEAT (t0 = now - beat_phase * period). The governor calls it every
+        frame, so bar 0 restarted every beat: bar_phase never left
+        [0, 1/beats_per_bar), beat_index was always 0 (every beat read as the
+        downbeat, so the accent profile and is_strong_beat were constant),
+        and a pattern cycle -- one bar -- never advanced past its first beat,
+        which is why the hit layer could only play a pattern's opening slots
+        over and over. Anchoring on the bar phase keeps the beat phase fixed
+        as well (beat_phase = frac(bar_phase * beats_per_bar)), so nothing
+        that relied on beat continuity changes.
+        """
+        ph_bar = self.bar_phase(now_s)
         self.p.period_s = float(period_s)
         self.clamp()
-        self.t0 = now_s - ph * self.p.period_s
+        self.t0 = now_s - ph_bar * self.bar_len_s()
         self.projection_s = self.p.period_s
 
     def set_elastic(self, k: float) -> None:

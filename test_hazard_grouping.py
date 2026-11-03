@@ -1,4 +1,4 @@
-# test_hazard_grouping.py -- Audible Lava / DSO v4.4
+# test_hazard_grouping.py -- Audible Lava / DSO v4.9.3
 # Behavioural tests for the event-model grouping layer.
 #
 # The properties that matter are the ones the old beam could not provide:
@@ -6,6 +6,14 @@
 #   * phrase length is LEARNED, not configured
 #   * evidence is SCALE-FREE (rule-weight magnitude and lamp brightness cancel)
 #   * boundary rate is bounded and sane without any threshold
+#
+# v4.9.3 adds the guards that break the churn feedback loop:
+#   * the learned mean is FLOORED (default 8 s) and the hazard is CAPPED
+#     (default 25 %/s), so a burst of evidence cannot collapse the phrase
+#     model and pin the hazard at 1
+#   * the prior carries 20 pseudo-observations, so the first dozen
+#     boundaries cannot drag the mean to the floor
+#   * reset_learning() restores the prior live
 #
 # Run: python test_hazard_grouping.py  |  pytest test_hazard_grouping.py -v
 
@@ -39,7 +47,8 @@ def ev(**kw):
     base = dict(t=0.0, dt=DT, since_boundary=10.0, since_event=1.0, phrase_mean_len=25.0,
                 ke_z=0.0, occ_z=0.0, flux_z=0.0, coh_z=0.0, pairvar_z=0.0,
                 collin_event=0.0, com_cross=0.0, bocpd_max=0.0,
-                cond_entropy_z=0.0, wdiag_z=0.0, saddle_strength=0.0, n_cues=0.0)
+                cond_entropy_z=0.0, wdiag_z=0.0, saddle_strength=0.0, n_cues=0.0,
+                count_z=0.0)
     base.update(kw)
     return base
 
@@ -92,30 +101,100 @@ def gam_03_hazard_rises_monotonically_through_the_body():
 
 @test
 def gam_04_learns_the_observed_interval_distribution():
-    m = GammaIntervalModel(prior_mean=25.0)
+    """With the v4.4 prior strength (2 pseudo-observations) the model still
+    learns the observed distribution outright; with the v4.9.3 default (20)
+    it moves toward it and keeps ~9 % of the prior at steady state."""
+    m = GammaIntervalModel(prior_mean=25.0, prior_strength=2.0)
     for _ in range(60):
         m.observe(float(RNG.normal(8.0, 1.0)))       # much shorter than the prior
     assert abs(m.mean - 8.0) < 1.5, f"learned mean {m.mean:.1f}, want ~8"
     assert m.shape > 5.0, f"regular intervals should give high shape, got {m.shape:.1f}"
 
+    d = GammaIntervalModel(prior_mean=25.0)          # default prior_strength 20
+    for _ in range(60):
+        d.observe(float(RNG.normal(8.0, 1.0)))
+    assert 8.0 < d.mean < 25.0 and abs(d.mean - 8.0) < abs(25.0 - 8.0) * 0.6, \
+        f"after 60 obs the default model should sit between prior and data, nearer the data: {d.mean:.1f}"
+    for _ in range(600):
+        d.observe(float(RNG.normal(8.0, 1.0)))
+    # steady state: observation count saturates at 1/(1-0.995) = 200, so the
+    # prior keeps 20/220 = 9 % of the weight -> mean ~ 0.09*25 + 0.91*8 = 9.5
+    assert 8.5 < d.mean < 11.0, f"steady-state mean {d.mean:.1f}, expected ~9.5"
+    assert d.shape > 3.0, f"shape {d.shape:.1f}"
+
 
 @test
-def gam_05_prior_washes_out_in_a_handful_of_boundaries():
+def gam_05_prior_resists_a_handful_of_boundaries():
+    """v4.9.3 inverts the v4.4 property: 6 short intervals must NOT move the
+    mean much, 20 of them should move it about halfway."""
     m = GammaIntervalModel(prior_mean=25.0)
     before = m.mean
     for _ in range(6):
         m.observe(8.0)
-    assert m.mean < 0.65 * before, f"prior still dominant after 6 observations: {m.mean:.1f}"
+    assert m.mean > 0.8 * before, f"prior gave way after 6 observations: {m.mean:.1f}"
+    for _ in range(14):
+        m.observe(8.0)
+    assert 15.0 < m.mean < 18.5, f"after 20 observations expected ~16.5, got {m.mean:.1f}"
+    assert 0.45 < m._prior_weight < 0.55, f"prior weight {m._prior_weight:.2f} after 20 obs"
 
 
 @test
 def gam_06_shape_distinguishes_regular_from_memoryless():
-    reg = GammaIntervalModel(prior_mean=20.0)
-    irr = GammaIntervalModel(prior_mean=20.0)
+    reg = GammaIntervalModel(prior_mean=20.0, prior_strength=2.0)
+    irr = GammaIntervalModel(prior_mean=20.0, prior_strength=2.0)
     for _ in range(80):
         reg.observe(20.0 + float(RNG.normal(0, 0.5)))
         irr.observe(float(RNG.exponential(20.0)))
     assert reg.shape > 3 * irr.shape, f"regular {reg.shape:.1f} vs irregular {irr.shape:.1f}"
+
+
+@test
+def gam_07_mean_floor_breaks_the_collapse():
+    """The failure seen live: a run of sub-second intervals dragged the mean
+    to ~0.4 s and the hazard to 1. Now the mean stops at the floor, the
+    floored model keeps a refractory tail (shape capped at the prior's), and
+    the per-frame hazard stays small."""
+    m = GammaIntervalModel(prior_mean=25.0, prior_strength=2.0)
+    for _ in range(400):
+        m.observe(0.4)
+    assert m.raw_mean < 1.0, f"raw blend should have collapsed: {m.raw_mean:.2f}"
+    assert abs(m.mean - m.mean_floor) < 1e-9 and m.floor_active, f"mean {m.mean:.2f} not at floor"
+    assert m.shape <= m.prior_shape + 1e-9, f"floored model became near-periodic: shape {m.shape:.1f}"
+    assert m.hazard(0.3, DT) < 1e-3, "no refractory period at the floor"
+    assert m.hazard(2.0, DT) < 0.01
+    assert m.hazard(0.4, 1.0) < 0.05, "a 0.4 s phrase must not be 'due'"
+    m2 = GammaIntervalModel(prior_mean=25.0, mean_floor=10.0)
+    assert m2.mean_floor == 10.0 and m2.mean >= 10.0
+
+
+@test
+def gam_08_hazard_is_capped():
+    """However overdue, at most hazard_cap_per_sec per second (and the exact
+    survival form 1 - exp(-h dt) per frame, never the old clip(h dt, 0, 1))."""
+    m = GammaIntervalModel(prior_mean=25.0)
+    cap = m.hazard_cap_per_sec
+    for tau in (40.0, 100.0, 1000.0, 1e6):
+        assert m.hazard(tau, 1.0) <= cap + 1e-9, f"tau={tau}: {m.hazard(tau, 1.0):.3f} > cap {cap}"
+        per_frame = m.hazard(tau, DT)
+        assert per_frame <= 1.0 - math.exp(-m.hazard_rate_cap * DT) + 1e-12
+    assert m.hazard(1e6, 1.0) > 0.9 * cap, "deep in the tail the hazard should sit AT the cap"
+    assert m.hazard(1e6, DT) < 0.03, "per-frame hazard must stay far below 1"
+    # cap is a probability per second: 30 frames at the cap compound to ~cap
+    p = 1.0 - (1.0 - m.hazard(1e6, 1.0 / 30.0)) ** 30
+    assert abs(p - cap) < 0.01, f"30 capped frames compound to {p:.3f}, cap {cap}"
+    m3 = GammaIntervalModel(prior_mean=25.0, hazard_cap_per_sec=0.5)
+    assert m3.hazard(1e6, 1.0) > m.hazard(1e6, 1.0)
+
+
+@test
+def gam_09_reset_restores_the_prior():
+    m = GammaIntervalModel(prior_mean=25.0)
+    for _ in range(300):
+        m.observe(6.0)
+    assert m.mean < 20.0
+    m.reset()
+    assert abs(m.mean - 25.0) < 1e-9 and len(m.intervals) == 0 and m.state()["n_observed"] == 0
+    assert abs(m.shape - m.prior_shape) < 1e-6
 
 
 # ── Robust standardiser ─────────────────────────────────────────────────────
@@ -229,19 +308,20 @@ def hg_06_rule_weight_scale_does_not_change_behaviour():
 @test
 def hg_07_learned_model_is_self_consistent():
     """The model has no target rate to hit -- it learns whatever rate emerges.
-    The property to check is that the fitted mean matches the intervals the
-    system actually produced (and so departs from the prior when the evidence
-    warrants it)."""
+    v4.9.3: with 50 pseudo-observations the fitted mean sits BETWEEN the
+    prior and the intervals the system actually produced, having departed
+    from the prior toward the data."""
     m = module(seed=5)
     def busy(f):
         return loud() if (f // 30) % 4 == 0 else quiet()
     fired = run(m, int(15 * 700), busy)
     assert m.n_boundaries >= 6, f"only {m.n_boundaries} boundaries -- cannot learn"
     observed = np.diff([0.0] + fired)
-    assert abs(m.intervals.mean - observed.mean()) < 0.35 * observed.mean(), \
-        f"fitted mean {m.intervals.mean:.1f}s vs observed {observed.mean():.1f}s"
-    assert abs(m.intervals.mean - GammaIntervalModel.PRIOR_MEAN_SECS) > 5.0, \
-        "model never departed from the prior"
+    prior = GammaIntervalModel.PRIOR_MEAN_SECS
+    lo, hi = sorted((float(observed.mean()), prior))
+    assert lo - 1.0 <= m.intervals.mean <= hi + 1.0, \
+        f"fitted mean {m.intervals.mean:.1f}s outside [observed {observed.mean():.1f}, prior {prior}]"
+    assert abs(m.intervals.mean - prior) > 2.0, "model never departed from the prior"
 
 
 @test
@@ -261,6 +341,39 @@ def hg_07b_denser_evidence_gives_shorter_phrases():
 
 
 @test
+def hg_07c_continuous_churn_cannot_pin_the_hazard():
+    """The live failure, reproduced: evidence that is loud a third of the time
+    for ten minutes. v4.4 collapsed the mean to well under a second and fired
+    ~150 boundaries a minute; now the floor, cap and prior bound the rate."""
+    m = module(seed=4)
+    churn = lambda f: loud() if (f // 15) % 3 == 0 else quiet()     # 1 s loud every 3 s
+    max_hz = 0.0
+    fired, placed, t = [], [], 0.0
+    for f in range(int(15 * 600)):
+        t += DT
+        d = m.update(churn(f), DT)
+        max_hz = max(max_hz, d.hazard)
+        if d.fired:
+            fired.append(t)                      # when it was REPORTED (commit lag later)
+            placed.append(m.last_boundary_t)     # where the boundary was PLACED
+    per_min = len(fired) / 10.0
+    assert per_min <= 60.0 / m.intervals.mean_floor + 0.5, \
+        f"{per_min:.1f} boundaries/min exceeds the floor's ceiling"
+    assert per_min <= 8.0, f"{per_min:.1f} boundaries/min under churn"
+    assert m.intervals.mean >= m.intervals.mean_floor - 1e-9
+    assert max_hz < 0.05, f"per-frame hazard reached {max_hz:.3f} -- was pinned at 1.0 in v4.4"
+    ivals = np.diff([0.0] + placed)              # phrase lengths = placement intervals
+    assert ivals.min() >= HazardGroupingModule.REVISION_WINDOW_S, \
+        f"a {ivals.min():.2f}s phrase slipped through (a re-placed boundary fired twice)"
+    # the floor is on the MEAN, not on each phrase: with the evidence bursting
+    # every 3 s and a 20-observation prior the model legitimately learns a
+    # ~13 s mean and places a fair share of boundaries on the 3 s bursts.
+    # What must NOT happen is the sub-second collapse; short phrases should
+    # stay a minority.
+    assert float((ivals < 4.0).mean()) < 0.40, f"{100*(ivals < 4.0).mean():.0f}% of phrases under 4 s"
+
+
+@test
 def hg_08_depth_is_graded_by_evidence_strength():
     m = module()
     m.t = 500.0; m.last_boundary_t = 0.0
@@ -277,7 +390,8 @@ def hg_09_regularity_rule_is_dropped():
     m = module()
     names = [r.name for r in m.rules]
     assert "regularity" not in names, "regularity is superseded by the hazard"
-    for expected in ("gap", "change", "saddle", "changepoint", "regime", "relational", "coincidence"):
+    for expected in ("gap", "change", "saddle", "changepoint", "regime", "relational", "coincidence",
+                     "count_change"):
         assert expected in names, f"missing rule {expected}"
 
 
@@ -362,9 +476,46 @@ def hg_10_state_is_introspectable():
     run(m, 300, lambda f: quiet())
     st = m.state()
     for k in ("p_boundary", "hazard", "evidence", "z", "phrase_model", "evidence_model",
-              "beam", "segmentation"):
+              "beam", "segmentation", "n_resets"):
         assert k in st, k
-    assert "mean_secs" in st["phrase_model"] and "shape" in st["phrase_model"]
+    pm = st["phrase_model"]
+    for k in ("mean_secs", "shape", "raw_mean_secs", "floor_active", "mean_floor_secs",
+              "hazard_cap_per_sec", "prior_strength", "prior_weight"):
+        assert k in pm, k
+
+
+@test
+def hg_10a_reset_learning_restores_the_prior_live():
+    """The EDIT-surface action: after a drifted run, reset_learning() puts
+    the phrase prior back, forgets the evidence null, keeps the beam and
+    the edited prior parameters, and the module keeps decoding."""
+    m = module(seed=7)
+    m.set_weight("prior_phrase_secs", 20.0)
+    m.set_weight("phrase_floor_secs", 6.0)
+    dense = lambda f: loud() if (f // 30) % 3 == 0 else quiet()
+    run(m, int(15 * 600), dense)
+    assert m.n_boundaries > 5 and m.intervals.mean < 20.0
+    assert m.evidence.n > 100
+    beam_len = len(m.beam)
+    m.reset_learning()
+    assert m.n_resets == 1
+    assert abs(m.intervals.mean - 20.0) < 1e-9, f"prior not restored: {m.intervals.mean:.1f}"
+    assert m.intervals.mean_floor == 6.0, "edited floor lost on reset"
+    assert m.intervals.state()["n_observed"] == 0 and m.evidence.n == 0
+    assert len(m.beam) == beam_len, "beam should survive a learning reset"
+    before = m.n_boundaries
+    run(m, int(15 * 200), dense)
+    assert m.n_boundaries > before, "module stopped decoding after reset"
+
+
+@test
+def hg_10b_new_weights_are_live():
+    m = module()
+    m.set_weight("prior_strength", 10.0);        assert m.intervals.n0 == 10.0
+    m.set_weight("phrase_floor_secs", 12.0);     assert m.intervals.mean_floor == 12.0
+    m.set_weight("hazard_cap_per_sec", 0.1);     assert abs(m.intervals.hazard_cap_per_sec - 0.1) < 1e-12
+    assert m.intervals.hazard(1e6, 1.0) <= 0.1 + 1e-9
+    assert m.intervals.mean >= 12.0
 
 
 @test
@@ -374,7 +525,14 @@ def hg_11_deleted_configuration_is_gone():
     for dead in ("commit_threshold", "switch_cost", "forget", "temperature"):
         assert dead not in gw, f"{dead} should no longer exist in the grouping weights"
     assert "regularity" not in gw["rules"]
-    assert set(gw) == {"prior_phrase_secs", "evidence_rate", "rules"}, sorted(gw)
+    assert set(gw) == {"prior_phrase_secs", "prior_strength", "phrase_floor_secs", "hazard_cap_per_sec",
+                       "evidence_rate", "min_cue_age_secs", "pers_tau_secs", "count_tau_secs",
+                       "rules"}, sorted(gw)
+    assert gw["prior_strength"] == GammaIntervalModel.PRIOR_STRENGTH
+    assert gw["phrase_floor_secs"] == GammaIntervalModel.MEAN_FLOOR_SECS
+    assert gw["hazard_cap_per_sec"] == GammaIntervalModel.HAZARD_CAP_PER_SEC
+    assert "count_change" in gw["rules"]
+    assert SG.DEFAULT_WEIGHTS["_version"] == 3, "do not bump _version: it would overwrite a user's weights file"
 
 
 @test

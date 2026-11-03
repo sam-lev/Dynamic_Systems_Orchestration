@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-# audible_lava.py -- Audible Lava / DSO v4.9.1 (MPE Edition)
+# audible_lava.py -- Audible Lava / DSO v4.9.4 (MPE Edition)
+#
+# v4.9.4 (Nov 2026): pattern-layer hits are sent as OSC bundles stamped with
+# their due wall-clock time (send_timed_hits) instead of immediately; nothing
+# else changed.
 #
 # Startup:
 #   if no lamp_profile.json exists, the calibration GUI opens first.
@@ -354,6 +358,48 @@ def draw_status(overlay, voices, leaves, blobs, fps,
 
 
 # ── Controller-event dispatch (the bits VoiceManager doesn't handle alone) ────
+
+# ── v4.9.4 timed hit sends ────────────────────────────────────────────────────
+# The pattern scheduler returns (t_on, args) with t_on in GOVERNOR time (the
+# governor's own clock, which advances by frame_interval per frame and starts
+# at 0). Until v4.9.3 the main loop ignored t_on and sent every hit the
+# moment it was rendered, so hits sounded up to one look-ahead window
+# (0.3 s) early and the elastic pull on the hit layer was lost on the way
+# out. Now each hit goes out as an OSC bundle stamped with the wall-clock time
+# it is due: wall_due = now + (t_on - governor.t). scsynth schedules bundles
+# itself (sample-accurate, independent of Python's frame jitter). A bundle
+# that is already late is still played, with a "late" line in the post window.
+_bundle_warned = False
+
+
+def send_timed_hits(osc, msgs, governor_now_s, wall_now_s):
+    """Send [(t_on, args)] as timestamped OSC bundles; fall back to immediate
+    sends if the bundle classes are unavailable."""
+    global _bundle_warned
+    if not msgs:
+        return 0
+    try:
+        from pythonosc import osc_bundle_builder, osc_message_builder
+    except Exception as exc:
+        if not _bundle_warned:
+            print(f"  ! timed hits unavailable ({exc}); sending immediately")
+            _bundle_warned = True
+        for _t_on, args in msgs:
+            osc.send_message(args[0], args[1:])
+        return len(msgs)
+    n = 0
+    for t_on, args in msgs:
+        due = wall_now_s + (float(t_on) - float(governor_now_s))
+        b = osc_bundle_builder.OscBundleBuilder(due)
+        m = osc_message_builder.OscMessageBuilder(address=args[0])
+        for a in args[1:]:
+            m.add_arg(a)
+        b.add_content(m.build())
+        osc.send(b.build())
+        n += 1
+    return n
+
+
 def dispatch_controller_event(ev, voices, binding, tracked):
     """
     Some events need the BindingManager (lifecycle changes); the rest go
@@ -614,8 +660,9 @@ def main():
                                 tracked,
                                 voice_of=lambda bid: voices.voices_by_blob.get(bid),
                             )
-                            for t_on, args in msgs:
-                                voices.osc.send_message(args[0], args[1:])
+                            # v4.9.4: honour the scheduler's timestamps (see
+                            # send_timed_hits) instead of sending at once.
+                            send_timed_hits(voices.osc, msgs, governor.t, time.time())
                         except Exception as exc:
                             if not getattr(dispatch_controller_event, "_pat_warned", False):
                                 print(f"  ! pattern layer error: {exc}")
@@ -707,7 +754,7 @@ def main():
                 draw_voice_hud(overlay, voices, keyboard, binding,
                                show_hud=show_hud)
 
-                cv2.imshow("Audible Lava v4.9 (MPE)", overlay)
+                cv2.imshow("Audible Lava v4.9.4 (MPE)", overlay)
 
                 if show_masks:
                     masks = detector.get_debug_masks(roi, grey=grey)

@@ -24,6 +24,12 @@
 #                                 evidence and form-level recurrence.
 #
 # Nothing here mutates tracker / detection / audio state.
+#
+# v4.9.3: SystemStateTracker.update() takes an optional `count_override`.
+# The governor passes its persistence-gated, time-smoothed blob count so the
+# symbol's blob-count digit (and therefore the Markov surprisal / conditional
+# entropy that feed boundary evidence) stops flickering with every
+# one-frame detection dropout. Omitting it keeps the previous behaviour.
 
 from __future__ import annotations
 
@@ -526,7 +532,14 @@ class SystemStateTracker:
 
     # -- main update --------------------------------------------------------
     def update(self, blobs, dt: float, diagram: Optional[Sequence[Tuple[float, float]]] = None,
-               tree_stats: Optional[dict] = None) -> SystemSummary:
+               tree_stats: Optional[dict] = None,
+               count_override: Optional[float] = None) -> SystemSummary:
+        """Per-frame update.
+
+        `count_override` (v4.9.3, optional): a smoothed / gated blob count
+        used ONLY for the symbol's blob-count digit. `s.blob_count` itself
+        stays the raw tracked count so every other consumer is unchanged.
+        """
         self.t += float(dt)
         s = SystemSummary(t=self.t)
         blobs = list(blobs)
@@ -582,7 +595,7 @@ class SystemStateTracker:
         s.extra["perm_entropy_flux"] = permutation_entropy(self.signal("flux")[-64:])
 
         # symbolize + Markov
-        s.symbol = self.symbolize(s, agg)
+        s.symbol = self.symbolize(s, agg, count_override=count_override)
         s.surprisal = self.markov.update(s.symbol)
         s.cond_entropy = self.markov.conditional_entropy(s.symbol)
         s.entropy_rate = self.markov.entropy_rate()
@@ -592,9 +605,14 @@ class SystemStateTracker:
         self.history.append(s)
         return s
 
-    def symbolize(self, s: SystemSummary, agg: Dict[str, float]) -> int:
+    def symbolize(self, s: SystemSummary, agg: Dict[str, float],
+                  count_override: Optional[float] = None) -> int:
         """Coarse-grain the macrostate into a small integer alphabet.
-        Each quantized dimension contributes a digit (mixed radix)."""
+        Each quantized dimension contributes a digit (mixed radix).
+
+        `count_override`, when given, replaces the raw blob count in the
+        blob-count digit only (v4.9.3: the governor's smoothed, persistence-
+        gated count, so one-frame dropouts do not change the symbol)."""
         def q(v, edges):
             return int(np.searchsorted(np.asarray(edges), v))
         # v4.6: the occupancy-entropy digit is dropped. It was the least
@@ -602,8 +620,9 @@ class SystemStateTracker:
         # it tripled the alphabet, 81 -> 243. A smaller alphabet means each
         # symbol accumulates observations sooner, which is what lets the
         # transition model actually learn within a session.
+        count_v = s.blob_count if count_override is None else float(count_override)
         digits = [
-            q(s.blob_count, self.quant["blob_count"]),
+            q(count_v, self.quant["blob_count"]),
             q(s.coherence, self.quant["coherence"]),
             q(s.ke_total / self.ke_ref, self.quant["ke_norm"]),
             q(agg["flux"], self.quant["flux_sign"]),

@@ -157,8 +157,10 @@ def test_hazard_prune():
 # ── 2. Band pitch ────────────────────────────────────────────────────────────
 def test_band_mapping():
     print("[pitch] band -> midi")
-    bp = BandPitch(PitchParams())
+    bp = BandPitch(PitchParams(octave_range=3))
     check(bp.p.n_bands == 15, "15 bands for pentatonic x 3 octaves")
+    check(BandPitch(PitchParams()).p.n_bands == 10, "v4.9.3 default: 10 bands (2 octaves)")
+    check(BandPitch(PitchParams()).degree_to_midi(9) == 48 + 12 + 9, "v4.9.3 default top band -> A4 (m69)")
     check(bp.degree_to_midi(0) == 48, "band 0 -> C3")
     check(bp.degree_to_midi(5) == 60, "band 5 -> C4 (next octave)")
     check(bp.degree_to_midi(14) == 48 + 24 + 9, "band 14 -> A5")
@@ -167,7 +169,7 @@ def test_band_mapping():
 
 def test_hysteresis_no_flicker():
     print("[pitch] hysteresis at a band boundary")
-    bp = BandPitch(PitchParams(hysteresis=0.25))
+    bp = BandPitch(PitchParams(octave_range=3, hysteresis=0.25))
     bands = []
     # Boundary between band 7 and 8 is at height 8/15. Jitter +/- 0.1 band.
     boundary = 8 / 15
@@ -184,7 +186,7 @@ def test_hysteresis_no_flicker():
 
 def test_contour_dwell():
     print("[pitch] contour inertia (dwell)")
-    bp = BandPitch(PitchParams(dwell_s=0.8))
+    bp = BandPitch(PitchParams(octave_range=3, dwell_s=0.8))
     t = 0.0
     bp.update(1, 0.5, 0.0, t)
     # Rising for 0.3 s: not long enough
@@ -208,7 +210,7 @@ def test_contour_dwell():
 
 def test_stepwise_and_leaps():
     print("[pitch] interval size from speed, walking toward the band")
-    bp = BandPitch(PitchParams())
+    bp = BandPitch(PitchParams(octave_range=3))
     bp.update(1, 0.0, 0.0, 0.0)          # band 0, deg 0
     # Move the attractor far away (band 10) without a direction; speed slow.
     bp.update(1, 10.5 / 15, 0.0, 1.0)
@@ -229,7 +231,7 @@ def test_stepwise_and_leaps():
 
 def test_contour_within_slack():
     print("[pitch] contour wanders only within slack, then resolves")
-    bp = BandPitch(PitchParams(slack=2, dwell_s=0.0))
+    bp = BandPitch(PitchParams(octave_range=3, slack=2, dwell_s=0.0))
     bp.update(1, 7.5 / 15, 0.0, 0.0)         # band 7
     bp.update(1, 7.5 / 15, -1.0, 0.0)        # rising, dwell 0 -> immediate
     bp.update(1, 7.5 / 15, -1.0, 0.1)
@@ -242,7 +244,7 @@ def test_contour_within_slack():
 
 def test_turning_point_resolves():
     print("[pitch] turning point forces resolution")
-    bp = BandPitch(PitchParams(dwell_s=0.0, slack=3))
+    bp = BandPitch(PitchParams(octave_range=3, dwell_s=0.0, slack=3))
     bp.update(1, 7.5 / 15, 0.0, 0.0)
     bp.update(1, 7.5 / 15, -1.0, 0.0); bp.update(1, 7.5 / 15, -1.0, 0.1)
     bp.next_degree(1, 0.1); bp.next_degree(1, 0.1)
