@@ -1,5 +1,13 @@
 # rave_layer.py -- Audible Lava / DSO v4.11 "RAVE timbre transfer"
 #
+# v4.14 (Nov 2026): nineteen models (seven added from IRCAM's ACIDS catalogue:
+# sol_ordinario, sol_full, sol_ordinario_fast, musicnet, vintage, percussion,
+# VCTK) and the list is ORDERED BY FIT WITH THE LAMP, best first (see the
+# ranking note above MODELS). The tab maps the home row and then the top row
+# to that order (controller.RAVE_MODEL_KEYS). Rates the file name does not
+# give are taken from rave_status.json, so mismatches are flagged for the
+# ACIDS models too.
+#
 # Additive module. A final stage that translates the fully formed lava mix
 # (every \mpeVoiceRich, hit, melody note, strike and pad on bus 0) through one
 # or more pre-trained RAVE models -- RAVE being the Realtime Audio Variational
@@ -50,10 +58,11 @@
 # mix = 1.0 the dry is gone and the delay is invisible. No alignment delay is
 # applied to the dry path (it would have to be a guess per model).
 #
-# RATES: scsynth runs at 48 kHz (blob_synth_rich.scd). Two of the shipped
-# models were trained at 44.1 kHz (mrp_strengjavera, voice_vctk); nn.ar does
-# not resample, so those two run ~8.8 % off-rate. They still work, with a
-# slight spectral tilt; the GUI marks them.
+# RATES: scsynth runs at 48 kHz (blob_synth_rich.scd). Models trained at
+# 44.1 kHz (mrp_strengjavera, voice_vctk, and possibly some ACIDS models,
+# whose names carry no rate) run ~8.8 % off-rate because nn.ar does not
+# resample. They still work, with a slight spectral tilt; the GUI marks them
+# once the rate is known (from the file name, else from rave_status.json).
 #
 # Tests: test_rave_layer.py (no SuperCollider, camera or pygame).
 
@@ -117,24 +126,50 @@ def _model(key: str, file: str, label: str) -> RaveModel:
     return RaveModel(key, file, label, b, r, z)
 
 
-# The twelve shipped models. Keys are the handles both sides use; keep this in
-# step with ~raveModels in blob_synth_rave.scd (test_rave_layer.py checks).
+# The nineteen shipped models, ORDERED BY FIT WITH THE LAMP (v4.14). The lamp
+# sends slow, sustained harmonic drones with plucks, piano-like melody notes
+# and soft strikes on top. Models trained on pitched, sustained instrumental
+# sound follow those drones' pitch and dynamics, so the lamp's harmony
+# survives the transfer; texture models mostly map loudness to texture and
+# lose the pitch. Ranked by (1) how well the training set matches that input,
+# (2) instrumental range, (3) how clean and pleasant the result tends to be:
+#
+#   instrumental, wide range   sol_ordinario, sol_full, musicnet, crozzoli
+#   sustained harmonic         organ, mrp, solfast (cheaper SOL), vocalset
+#   plucked / slow contours    guitar, humpbacks
+#   broad but heavy            vintage (RAVE v1 "large", 482 MB: most CPU)
+#   voice blend                voicemulti
+#   texture                    birds, water, percussion
+#   speech (babble on drones)  vctkacids, vctk
+#   least pleasant on the lamp marine (decoder can chirp on start), magnets
+#
+# Keys are the handles both sides use; keep this in step with ~raveModels in
+# blob_synth_rave.scd (test_rave_layer.py checks). The GUI lists and keys the
+# models in this order.
 MODELS: List[RaveModel] = [
-    _model("birds",       "birds_dawnchorus_b2048_r48000_z8.ts",       "birds (dawn chorus)"),
-    _model("crozzoli",    "crozzoli_bigensemblesmusic_18d.ts",         "crozzoli big ensemble"),
-    _model("guitar",      "guitar_iil_b2048_r48000_z16.ts",            "guitar (IIL)"),
-    _model("humpbacks",   "humpbacks_pondbrain_b2048_r48000_z20.ts",   "humpback whales"),
-    _model("magnets",     "magnets_b2048_r48000_z8.ts",                "magnets"),
-    _model("marine",      "marinemammals_pondbrain_b2048_r48000_z20.ts", "marine mammals"),
-    _model("mrp",         "mrp_strengjavera_b2048_r44100_z16.ts",      "MRP piano (strengjavera)"),
+    _model("solord",      "sol_ordinario.ts",                          "SOL ordinario"),
+    _model("solfull",     "sol_full.ts",                               "SOL full"),
+    _model("musicnet",    "musicnet.ts",                               "MusicNet chamber"),
+    _model("crozzoli",    "crozzoli_bigensemblesmusic_18d.ts",         "crozzoli ensemble"),
     _model("organ",       "organ_archive_b2048_r48000_z16.ts",         "organ archive"),
-    _model("voicemulti",  "voice-multi-b2048-r48000-z11.ts",           "voice (multi)"),
-    _model("vctk",        "voice_vctk_b2048_r44100_z22.ts",            "voice (VCTK)"),
-    _model("vocalset",    "voice_vocalset_b2048_r48000_z16.ts",        "voice (VocalSet)"),
+    _model("mrp",         "mrp_strengjavera_b2048_r44100_z16.ts",      "MRP piano"),
+    _model("solfast",     "sol_ordinario_fast.ts",                     "SOL fast (light)"),
+    _model("vocalset",    "voice_vocalset_b2048_r48000_z16.ts",        "voice VocalSet"),
+    _model("guitar",      "guitar_iil_b2048_r48000_z16.ts",            "guitar IIL"),
+    _model("humpbacks",   "humpbacks_pondbrain_b2048_r48000_z20.ts",   "humpback whales"),
+    _model("vintage",     "vintage.ts",                                "vintage (heavy)"),
+    _model("voicemulti",  "voice-multi-b2048-r48000-z11.ts",           "voice multi"),
+    _model("birds",       "birds_dawnchorus_b2048_r48000_z8.ts",       "birds dawn chorus"),
     _model("water",       "water_pondbrain_b2048_r48000_z16.ts",       "water"),
+    _model("percussion",  "percussion.ts",                             "percussion"),
+    _model("vctkacids",   "VCTK.ts",                                   "voice VCTK ACIDS"),
+    _model("vctk",        "voice_vctk_b2048_r44100_z22.ts",            "voice VCTK IIL"),
+    _model("marine",      "marinemammals_pondbrain_b2048_r48000_z20.ts", "marine mammals"),
+    _model("magnets",     "magnets_b2048_r48000_z8.ts",                "magnets"),
 ]
 
 MODEL_BY_KEY: Dict[str, RaveModel] = {m.key: m for m in MODELS}
+LABEL_W = max(len(m.label) for m in MODELS) + 1      # listing column width
 
 
 def model_pan(index: int, n_models: int = len(MODELS), width: float = 0.6) -> float:
@@ -438,8 +473,9 @@ class RaveLayer:
         m  = MODELS[index]
         st = self.status.of(m.key)
         on = self.active[index]
-        rate = f"{m.rate // 1000}k" if m.rate else " ?k"
-        if m.rate and self.status.server_rate and m.rate != self.status.server_rate:
+        r = m.rate or (st.rate if isinstance(st.rate, int) and st.rate > 0 else None)
+        rate = f"{r // 1000}k" if r else " ?k"
+        if r and self.status.server_rate and r != self.status.server_rate:
             rate += "!"
         if st.status == "loaded":
             tag, kind = "", ("on" if on else "off")
@@ -450,7 +486,7 @@ class RaveLayer:
         else:
             tag, kind = "  (not verified)", ("on" if on else "unverified")
         box = "[x]" if on else "[ ]"
-        return (f" {key_char}  {box}  {m.label:<26}{rate:>5}{tag}", kind)
+        return (f" {key_char}  {box}  {m.label:<{LABEL_W}}{rate:>5}{tag}", kind)
 
     def panel_lines(self, keys: str = RAVE_MODEL_KEYS) -> List[Tuple[str, str]]:
         head = (f"RAVE timbre transfer   {'ON ' if self.enabled else 'OFF'}   "
@@ -462,13 +498,14 @@ class RaveLayer:
                           "(models are listed unverified)", "warn"))
         elif not self.status.available:
             lines.append(("nn.ar not installed in SuperCollider: nothing will sound through RAVE", "warn"))
+        lines.append(("models listed best-first for the lamp: instrumental > voice > texture", "hint"))
         lines.append(("", ""))
         for i in range(len(MODELS)):
             k = keys[i] if i < len(keys) else "?"
             lines.append(self.model_line(i, k))
         lines.append(("", ""))
-        lines.append(("home row  toggle model     SPACE  layer on/off     Z  all off     R  re-read status",
-                      "hint"))
+        lines.append(("home row, then q w e t y u i  toggle model    SPACE  layer on/off    "
+                      "Z  all off    R  re-read status", "hint"))
         lines.append(("up/dn  mix +/-0.05     +/-  mix +/-0.25     left/right  input gain /1.4 x1.4", "hint"))
         return lines
 

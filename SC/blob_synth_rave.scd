@@ -1,5 +1,13 @@
 // blob_synth_rave.scd -- Audible Lava / DSO v4.11 "RAVE timbre transfer"
 //
+// v4.14: nineteen models (adds IRCAM ACIDS sol_ordinario, sol_full,
+// sol_ordinario_fast, musicnet, vintage, percussion, VCTK), listed best-first
+// for the lamp; same order as rave_layer.MODELS. Loading all nineteen
+// descriptions takes longer (~1-3 s each); only models switched on in the tab
+// run inference. The ACIDS names carry no sample rate: nn.ar reports it when
+// the release has the accessor, else the post window shows "rate ?".
+// vintage is a RAVE v1 "large" model (482 MB): expect the most CPU of all.
+//
 // ADDITIVE. Evaluate AFTER blob_synth_rich.scd (the server is booted by then).
 // Nothing in the other .scd files is touched; with this file never evaluated
 // the system runs exactly as v4.10 (Python's rave_layer sends /s_new for
@@ -19,7 +27,7 @@
 //      resolves the model by index when the SynthDef is BUILT, which is why
 //      there is one SynthDef per model rather than one with a selector --
 //      and why each node holds its own independent instance of its model
-//      (twelve models on at once would be twelve inference threads).
+//      (every model on at once would be one inference thread each).
 //   3. Builds \raveSplit, the node that copies bus 0 to a private bus for the
 //      models and scales the dry mix.
 //   4. Writes rave_status.json next to the models so Python's GUI can show
@@ -46,8 +54,8 @@
 //
 // NOTES
 //   * nn.ar does not resample: a model trained at 44.1 kHz run at 48 kHz is
-//     ~8.8 % off-rate (slight spectral tilt). Two of the twelve are 44.1 k;
-//     the post window and the Python GUI flag them.
+//     ~8.8 % off-rate (slight spectral tilt). mrp and vctk are 44.1 k (and
+//     possibly some ACIDS models); the post window and the Python GUI flag them.
 //   * Each model node runs inference on its own thread (bufferSize > 0). It
 //     is silent for a moment after /s_new while the thread loads its model;
 //     the fade-in covers that. Destroying the node waits for that thread,
@@ -61,25 +69,33 @@
 // compile error).
 
 ~raveModelDir   = ~raveModelDir   ? "~/Documents/RAVE_PreTrained_Models".standardizePath;
-~raveBufferSize = ~raveBufferSize ? -1;     // -1 = each model's own minimum (2048 here);
+~raveBufferSize = 8192;//~raveBufferSize ? -1;     // -1 = each model's own minimum (2048 here);
                                             // 4096 trades latency for smoother CPU use
 ~raveBus        = ~raveBus        ? 64;     // must match rave_layer.RAVE_BUS
 
 // key <-> file. Keys are shared with rave_layer.MODELS (test_rave_layer.py
-// checks the two lists agree); the GUI's home-row order is this order.
+// checks the two lists agree). v4.14: ordered best-first for the lamp; the
+// GUI lists and keys them in this order.
 ~raveModels = [
-    [\birds,      "birds_dawnchorus_b2048_r48000_z8.ts"],
+    [\solord,     "sol_ordinario.ts"],
+    [\solfull,    "sol_full.ts"],
+    [\musicnet,   "musicnet.ts"],
     [\crozzoli,   "crozzoli_bigensemblesmusic_18d.ts"],
+    [\organ,      "organ_archive_b2048_r48000_z16.ts"],
+    [\mrp,        "mrp_strengjavera_b2048_r44100_z16.ts"],
+    [\solfast,    "sol_ordinario_fast.ts"],
+    [\vocalset,   "voice_vocalset_b2048_r48000_z16.ts"],
     [\guitar,     "guitar_iil_b2048_r48000_z16.ts"],
     [\humpbacks,  "humpbacks_pondbrain_b2048_r48000_z20.ts"],
-    [\magnets,    "magnets_b2048_r48000_z8.ts"],
-    [\marine,     "marinemammals_pondbrain_b2048_r48000_z20.ts"],
-    [\mrp,        "mrp_strengjavera_b2048_r44100_z16.ts"],
-    [\organ,      "organ_archive_b2048_r48000_z16.ts"],
+    [\vintage,    "vintage.ts"],
     [\voicemulti, "voice-multi-b2048-r48000-z11.ts"],
+    [\birds,      "birds_dawnchorus_b2048_r48000_z8.ts"],
+    [\water,      "water_pondbrain_b2048_r48000_z16.ts"],
+    [\percussion, "percussion.ts"],
+    [\vctkacids,  "VCTK.ts"],
     [\vctk,       "voice_vctk_b2048_r44100_z22.ts"],
-    [\vocalset,   "voice_vocalset_b2048_r48000_z16.ts"],
-    [\water,      "water_pondbrain_b2048_r48000_z16.ts"]
+    [\marine,     "marinemammals_pondbrain_b2048_r48000_z20.ts"],
+    [\magnets,    "magnets_b2048_r48000_z8.ts"]
 ];
 
 ~raveLoaded = List.new;          // keys whose SynthDef exists

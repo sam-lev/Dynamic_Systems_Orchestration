@@ -43,6 +43,10 @@ notes.txt
 # timing/checking implementations with mprof prior infrastructure of algorithms
 #
 
+#media
+*.png
+*.wav
+
 #
 #    End Personal Ignores
 #

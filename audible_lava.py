@@ -1,9 +1,28 @@
 #!/usr/bin/env python3
-# audible_lava.py -- Audible Lava / DSO v4.11 (MPE Edition)
+# audible_lava.py -- Audible Lava / DSO v4.13 (MPE Edition)
 #
-# v4.10.3 (Nov 2026): 'k' on the video window respawns the master space
-#   (MasterSpace.respawn) to clear its reverb / Greyhole state if a bad value
-#   ever silences the tails. See blob_synth_rich.scd v4.10.3.
+# v4.13 (Nov 2026): one blob, one voice (tracker_stability.py, additive).
+#   A still blob whose detected persistence region fluctuates no longer
+#   spawns a stream of new voices that glide away. StableBlobTracker wraps
+#   BlobTracker: fragments of one tracked blob are fused; a region that is a
+#   small part of a known blob is treated as a partial view (known geometry,
+#   centroid barely moves); new regions are offered to coasting tracks before
+#   any birth; births need 3 consecutive detections (one-cycle flickers never
+#   get a voice); coasting tracks stop extrapolating and stay near where they
+#   were last seen; still blobs drop the buoyancy prior.
+#   --no-stable-tracker restores the plain BlobTracker.
+#
+# v4.12 (Nov 2026): voice continuity (voice_continuity.py, additive).
+#   - Every tracked blob gets a voice: a blob re-identified under its old id
+#     (the tracker emits no birth for it), or missed at birth because the pool
+#     was full, used to stay silent for the rest of its life. It is now bound
+#     each frame: its zombie is resurrected if one matches, else it gets a new
+#     voice without a birth strike.
+#   - Level floor: governance can push a live voice into the background but
+#     not below 40 % of its base level (CONTINUITY_AMP_FLOOR).
+#   - The BEAT_PHASE -> AMP dip is proportional (a 28 % accent at any level)
+#     instead of a fixed -0.28 that muted dim voices on every beat.
+#   --no-continuity restores the v4.11 VoiceManager / BindingManager.
 #
 # v4.11 (Nov 2026): RAVE timbre-transfer layer (rave_layer.py +
 #   blob_synth_rave.scd, via the nn.ar SuperCollider extension). RAVE =
@@ -95,6 +114,8 @@
 #   python audible_lava.py --no-presound # no predicted-triad pre-sound (v4.10)
 #   python audible_lava.py --no-rave     # no RAVE layer at all (v4.11)
 #   python audible_lava.py --rave-on     # start with the RAVE layer on (v4.11)
+#   python audible_lava.py --no-continuity  # v4.11 voice binding / levels (v4.12)
+#   python audible_lava.py --no-stable-tracker  # plain v4.12 BlobTracker (v4.13)
 #
 # SuperCollider load order for the rich palette + RAVE:
 #   blob_synth.scd -> blob_synth_hits.scd -> melody_hit.scd
@@ -113,8 +134,6 @@
 #   v    toggle voice slot HUD
 #   n    toggle melody / rhythm layer                      (v4.9)
 #   x    toggle master space bypass (A/B the insert)       (v4.10)
-#   k    respawn the master space (clears reverb state)    (v4.10.3)
-#   p    toggle rich / classic synth palette live          (v4.10.4)
 #   a    toggle RAVE timbre-transfer layer                 (v4.11)
 #   b    re-capture background reference (configured mode) / reset MOG2
 #   w    re-capture background reference WARM (lamp already running) (v4.9)
@@ -141,6 +160,8 @@ from score_governor  import ScoreGovernor           # v4.2 topological score gra
 from melody_rhythm   import MelodyEngine            # v4.9 hazard onsets + band pitch
 import synth_palette                                # v4.10 rich palette + master space
 import rave_layer                                   # v4.11 RAVE timbre transfer
+import voice_continuity                             # v4.12 every tracked blob keeps a voice
+import tracker_stability                            # v4.13 one blob, one voice
 from controller      import (
     KeyboardController,
     NOTE_ON, NOTE_OFF, SELECT_SLOT, SET_PARAM,
@@ -184,7 +205,7 @@ BG_REF_METHOD        = "median"   # cold mode: "median" (robust) or "mean" (low-
 #          so the low percentile is the background. Use this when you start
 #          on a lamp that is already running. 90 s is a floor; 150 s is
 #          better. Press 'w' to re-capture warm at any time.
-BG_REF_MODE          = "cold"
+BG_REF_MODE          = "warm"
 BG_REF_CAPTURE_SECS  = 90.0
 BG_REF_PERCENTILE    = 25.0       # lower toward 10 if wax still shows in the
                                   # reference; raise toward 40 if blobs read
@@ -222,6 +243,23 @@ PRESOUND_GAIN        = 0.10       # amplitude at posterior_other = 1
 # plays the rich SynthDefs untouched. RAVE_MIX is the wet fraction while on
 # (dry * (1 - mix) + sum of models at mix / sqrt(n)); RAVE_IN_GAIN drives the
 # dry copy into the models (RAVE likes a healthy input level).
+# ── Voice continuity (v4.12) ─────────────────────────────────────────────────
+# CONTINUITY: bind tracked blobs that have no voice (re-identified / missed at
+# birth), floor live voices at CONTINUITY_AMP_FLOOR x base level, beat dip
+# proportional. --no-continuity = v4.11 behaviour.
+CONTINUITY           = True
+CONTINUITY_AMP_FLOOR = 0.4        # 0 disables the floor only
+CONTINUITY_MIN_AGE   = 8          # frames a blob must be tracked before a rebind
+
+# ── Tracker stability (v4.13) ────────────────────────────────────────────────
+# STABLE_TRACKER: fuse fragments, complete partial views, re-associate new
+# regions with coasting tracks, confirm births, damp coasting, stationary
+# mode. STABLE_CONFIRM_CYCLES detection cycles before a birth (1 = immediate;
+# 3 at DETECT_K=2 and 15 fps is ~0.4 s). --no-stable-tracker = v4.12 tracker.
+STABLE_TRACKER        = True
+STABLE_CONFIRM_CYCLES = 3
+STABLE_VERBOSE        = False      # print fused / re-associated / dropped events
+
 RAVE_LAYER           = True
 RAVE_ON_AT_START     = False
 RAVE_MIX             = 0.7
@@ -536,6 +574,10 @@ def main():
     use_presound    = PRESOUND and "--no-presound" not in sys.argv
     # v4.11 RAVE flags
     use_rave        = RAVE_LAYER and "--no-rave" not in sys.argv
+    # v4.12
+    use_continuity  = CONTINUITY and "--no-continuity" not in sys.argv
+    # v4.13
+    use_stable      = STABLE_TRACKER and "--no-stable-tracker" not in sys.argv
     rave_on         = RAVE_ON_AT_START or "--rave-on" in sys.argv
 
     # ── Load or create LampProfile ────────────────────────────────────────
@@ -599,15 +641,39 @@ def main():
                             bg_ref_mode=BG_REF_MODE,
                             bg_ref_capture_secs=BG_REF_CAPTURE_SECS,
                             bg_ref_percentile=BG_REF_PERCENTILE)
-    tracker  = BlobTracker(profile=profile,  max_coast=coast_cycles)
-    voices   = VoiceManager(
-        sc_ip=SC_IP, sc_port=SC_PORT,
-        n_slots=N_VOICE_SLOTS,
-        profile=profile,
-        zombie_window=ZOMBIE_WINDOW_SECS,
-    )
-    binding  = BindingManager(voices,
-                              blob_recent_play_window=BLOB_RECENT_PLAY_WINDOW)
+    if use_stable:                       # v4.13: same arguments, plus the fixes
+        tracker = tracker_stability.StableBlobTracker(
+            profile=profile, max_coast=coast_cycles,
+            confirm_cycles=STABLE_CONFIRM_CYCLES, verbose=STABLE_VERBOSE)
+    else:
+        tracker = BlobTracker(profile=profile,  max_coast=coast_cycles)
+    print(f"[Startup] Tracker: {'stable (v4.13)' if use_stable else 'plain BlobTracker (--no-stable-tracker)'}"
+          + (f"  (births confirmed after {STABLE_CONFIRM_CYCLES} detections)" if use_stable else ""))
+    # v4.12: the continuity subclasses (additive; same constructor arguments)
+    if use_continuity:
+        voices  = voice_continuity.ContinuityVoiceManager(
+            sc_ip=SC_IP, sc_port=SC_PORT,
+            n_slots=N_VOICE_SLOTS,
+            profile=profile,
+            zombie_window=ZOMBIE_WINDOW_SECS,
+            amp_floor_frac=CONTINUITY_AMP_FLOOR,
+        )
+        binding = voice_continuity.ContinuityBindingManager(
+            voices,
+            blob_recent_play_window=BLOB_RECENT_PLAY_WINDOW,
+            rebind_min_age=CONTINUITY_MIN_AGE)
+    else:
+        voices   = VoiceManager(
+            sc_ip=SC_IP, sc_port=SC_PORT,
+            n_slots=N_VOICE_SLOTS,
+            profile=profile,
+            zombie_window=ZOMBIE_WINDOW_SECS,
+        )
+        binding  = BindingManager(voices,
+                                  blob_recent_play_window=BLOB_RECENT_PLAY_WINDOW)
+    print(f"[Startup] Voice continuity: {'on' if use_continuity else 'off (--no-continuity)'}"
+          + (f"  (floor {CONTINUITY_AMP_FLOOR:.0%} of base, rebind after {CONTINUITY_MIN_AGE} frames)"
+             if use_continuity else ""))
     # ── v4.9 melody / rhythm layer (additive; reads VoiceManager read-only) ──
     # Requires melody_hit.scd to have been evaluated in SuperCollider after
     # blob_synth.scd. Only blobs bound to a live slot play notes, so the layer
@@ -708,7 +774,7 @@ def main():
     show_hud      = True
 
     print("[OpenCV window keys] q=quit  m=tree  t=track  f=flow"
-          "  c=masks  o=contours  v=HUD  n=melody  x=space-bypass  k=space-respawn  p=palette  a=rave"
+          "  c=masks  o=contours  v=HUD  n=melody  x=space-bypass  a=rave"
           "  b=rebaseline-bg  w=rebaseline-warm  r=show-reference  [/] persistence")
     quit_requested = False
 
@@ -923,14 +989,15 @@ def main():
                              "N": melody.enabled,
                              "A": rave is not None and rave.enabled},   # v4.11
                             detector.pers_thresh,
-                            extra=melody.hud_line(),
+                            extra=melody.hud_line()
+                                  + (f"  {tracker.hud_line()}" if use_stable else ""),
                             extra2=rig.hud_line()
                                    + (f"  {rave.hud_line()}" if rave is not None else ""))
 
                 draw_voice_hud(overlay, voices, keyboard, binding,
                                show_hud=show_hud)
 
-                cv2.imshow("Audible Lava v4.11 (MPE)", overlay)
+                cv2.imshow("Audible Lava v4.13 (MPE)", overlay)
 
                 # v4.9.6: the frozen background reference -- the "empty lamp"
                 # image every frame is differenced against. Shown next to the
@@ -987,16 +1054,6 @@ def main():
                     if rig.master is not None:
                         print(f"[Space] master insert "
                               f"{'BYPASSED' if rig.toggle_master_bypass() else 'active'}")
-                    else:
-                        print("[Space] master insert not installed (--no-space)")
-                elif key == ord("p"):                           # v4.10.4
-                    pal = rig.toggle_palette()
-                    print(f"[Synth] palette -> {pal.name}  (sustained voices migrate "
-                          f"as their slots respawn; hits / melody change at once)")
-                elif key == ord("k"):                           # v4.10.3
-                    if rig.master is not None:
-                        rig.master.respawn()
-                        print("[Space] master insert respawned")
                     else:
                         print("[Space] master insert not installed (--no-space)")
                 elif key == ord("a"):                           # v4.11

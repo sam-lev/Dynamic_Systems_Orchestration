@@ -1,5 +1,11 @@
 # controller.py -- Audible Lava / DSO v4.11 (MPE Edition)
 #
+# v4.14: the RAVE tab keys nineteen models: the home row (a s d f g h j k l ;
+# ' \) for the first twelve, then q w e t y u i for the rest (r stays "re-read
+# status", z "all off", digits select slots). Models are listed best-first for
+# the lamp (rave_layer.MODELS order). When the list does not fit the window
+# height, the model rows are drawn in two columns (rave_panel_layout).
+#
 # v4.11: a third tab, RAVE. TAB now cycles PERFORMANCE -> EDIT -> RAVE ->
 # PERFORMANCE once the main loop has installed a RAVE panel
 # (enable_rave_tab); without one TAB toggles the two modes exactly as before.
@@ -157,6 +163,7 @@ class Controller(Protocol):
 #
 # RAVE mode (v4.11; TAB from EDIT, only when enable_rave_tab was called):
 #   a s d f g h j k l ; ' \   toggle model 0..11 (home row, listing order)
+#   q w e t y u i              toggle model 12..18 (v4.14; r is skipped)
 #   space          whole RAVE layer on/off
 #   z              all models off
 #   r              re-read rave_status.json (after re-evaluating the .scd)
@@ -173,7 +180,43 @@ EDIT_MODE        = "EDIT"
 RAVE_MODE        = "RAVE"           # v4.11
 
 # v4.11: RAVE tab home row, one key per model in rave_layer.MODELS order.
-RAVE_MODEL_KEYS  = "asdfghjkl;'\\"
+# v4.14: + top row for models 12..18 (skipping r = re-read status; z = all off
+# and the digits = slot select are never model keys).
+RAVE_MODEL_KEYS  = "asdfghjkl;'\\qwetyui"
+RAVE_MODEL_KINDS = ("on", "off", "missing", "failed", "unverified")
+
+
+def rave_panel_layout(rows: list, width: int, height: int, *, top: int = 76,
+                      line_h: int = 16, bottom: int = 44, left: int = 16) -> list:
+    """Place RAVE panel rows: [(text, kind)] -> [(text, kind, x, y)].
+
+    One column when everything fits between `top` and height - `bottom`;
+    otherwise the consecutive model rows (kinds in RAVE_MODEL_KINDS) are split
+    into two columns, left column first, so nineteen models fit the default
+    880 x 440 window. Rows that still overflow are dropped (not drawn over
+    the bottom strip). Pure function, so it is testable without a display."""
+    avail = max(1, (height - bottom - top) // line_h)
+    idx = [i for i, (_t, k) in enumerate(rows) if k in RAVE_MODEL_KINDS]
+    two = len(rows) > avail and len(idx) >= 2 and idx == list(range(idx[0], idx[-1] + 1))
+    out, y = [], top
+    if not two:
+        for text, kind in rows:
+            out.append((text, kind, left, y)); y += line_h
+    else:
+        first, last = idx[0], idx[-1]
+        n = last - first + 1
+        half = (n + 1) // 2
+        col_w = max(1, (width - 2 * left) // 2)
+        for text, kind in rows[:first]:
+            out.append((text, kind, left, y)); y += line_h
+        for j in range(n):
+            text, kind = rows[first + j]
+            col, r = (0, j) if j < half else (1, j - half)
+            out.append((text, kind, left + col * col_w, y + r * line_h))
+        y += half * line_h
+        for text, kind in rows[last + 1:]:
+            out.append((text, kind, left, y)); y += line_h
+    return [e for e in out if e[3] <= height - bottom]
 
 # Map from QWERTY home/upper rows to MIDI offset within the current octave.
 # Layout is "piano-style" wrapped onto two rows; ';' = high B, "'" = high C.
@@ -741,14 +784,18 @@ class KeyboardController:
                     rows = list(self.rave_panel()) if self.rave_panel is not None else []
                 except Exception:
                     rows = [("RAVE panel error", "warn")]
-                lines = []
-                for text, kind in rows:
+                # v4.14: positioned by rave_panel_layout (two columns of
+                # models when the list is taller than the window)
+                rows = rows + [("TAB  return to PERFORMANCE", "tab")]
+                kind_col["tab"] = TEAL
+                for text, kind, x, yy in rave_panel_layout(rows, w, h, top=y, line_h=line_h):
                     if not text:
-                        lines.append(("", None, None)); continue
+                        continue
                     font = self._font_med if kind == "title" else (
-                        self._font_small if kind in ("hint", "warn") else self._font_mono)
-                    lines.append((text, kind_col.get(kind, TEXT), font))
-                lines.append(("TAB  return to PERFORMANCE", TEAL, self._font_small))
+                        self._font_small if kind in ("hint", "warn", "tab") else self._font_mono)
+                    surf = font.render(text, True, kind_col.get(kind, TEXT))
+                    self._screen.blit(surf, (x, yy))
+                lines = []
             else:  # EDIT
                 # v4.9.5: option list with descriptions. Top line names the
                 # keys that change the family; then the family's own

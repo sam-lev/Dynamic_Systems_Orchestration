@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# test_rave_layer.py -- Audible Lava / DSO v4.11
+# test_rave_layer.py -- Audible Lava / DSO v4.11 (v4.14: nineteen ranked models)
 # Tests for rave_layer.py and the RAVE tab in controller.py. No SuperCollider,
 # camera or pygame: OSC sends go to a recorder and the keyboard controller is
 # driven through a stand-in pygame module. Runs standalone:
@@ -20,12 +20,15 @@ from rave_layer import (MODELS, MODEL_BY_KEY, RaveLayer, install,
                         RAVE_BUS, SPLIT_NODE, MODEL_NODE_BASE)
 from controller import (ControllerEvent, RAVE_TOGGLE_MODEL, RAVE_TOGGLE, RAVE_SET,
                         RAVE_ALL_OFF, RAVE_RELOAD, RAVE_MODEL_KEYS, MODE_TOGGLE,
-                        SELECT_SLOT, NOTE_ON, PERFORMANCE_MODE, EDIT_MODE, RAVE_MODE)
+                        SELECT_SLOT, NOTE_ON, PERFORMANCE_MODE, EDIT_MODE, RAVE_MODE,
+                        RAVE_MODEL_KINDS, rave_panel_layout)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# The twelve files Sam listed, verbatim.
+# The model files in Sam's RAVE_PreTrained_Models folder (v4.14 listing,
+# rave_status.json excluded), verbatim.
 SHIPPED_FILES = """
+VCTK.ts
 birds_dawnchorus_b2048_r48000_z8.ts
 crozzoli_bigensemblesmusic_18d.ts
 guitar_iil_b2048_r48000_z16.ts
@@ -33,12 +36,28 @@ humpbacks_pondbrain_b2048_r48000_z20.ts
 magnets_b2048_r48000_z8.ts
 marinemammals_pondbrain_b2048_r48000_z20.ts
 mrp_strengjavera_b2048_r44100_z16.ts
+musicnet.ts
 organ_archive_b2048_r48000_z16.ts
+percussion.ts
+sol_full.ts
+sol_ordinario.ts
+sol_ordinario_fast.ts
+vintage.ts
 voice-multi-b2048-r48000-z11.ts
 voice_vctk_b2048_r44100_z22.ts
 voice_vocalset_b2048_r48000_z16.ts
 water_pondbrain_b2048_r48000_z16.ts
 """.split()
+
+# The listing order (best fit with the lamp first).
+RANKED_KEYS = ["solord", "solfull", "musicnet", "crozzoli", "organ", "mrp", "solfast",
+               "vocalset", "guitar", "humpbacks", "vintage", "voicemulti", "birds",
+               "water", "percussion", "vctkacids", "vctk", "marine", "magnets"]
+N = len(SHIPPED_FILES)
+
+
+def idx(key):
+    return [m.key for m in MODELS].index(key)
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
@@ -147,12 +166,27 @@ def press(pg, ch=None, key=None, up=False):
 # ── tests: model table ───────────────────────────────────────────────────────
 
 def test_model_table_matches_shipped_files():
-    assert len(MODELS) == 12
-    assert [m.file for m in MODELS] == SHIPPED_FILES, "file list must be exactly the shipped twelve"
-    assert len({m.key for m in MODELS}) == 12 and all(re.fullmatch(r"[a-z]+", m.key) for m in MODELS)
-    assert len(RAVE_MODEL_KEYS) == 12 and len(set(RAVE_MODEL_KEYS)) == 12
+    assert len(MODELS) == N == 19
+    assert sorted(m.file for m in MODELS) == sorted(SHIPPED_FILES), "every file in the folder, nothing else"
+    assert len({m.key for m in MODELS}) == N and all(re.fullmatch(r"[a-z]+", m.key) for m in MODELS)
+    assert len(RAVE_MODEL_KEYS) == N and len(set(RAVE_MODEL_KEYS)) == N
     assert MODEL_BY_KEY["birds"].synthdef == "raveXfer_birds"
-    assert MODEL_BY_KEY["birds"].path.endswith(os.path.join("RAVE_PreTrained_Models", SHIPPED_FILES[0]))
+    assert MODEL_BY_KEY["birds"].path.endswith(os.path.join("RAVE_PreTrained_Models",
+                                                            "birds_dawnchorus_b2048_r48000_z8.ts"))
+
+
+def test_models_are_listed_best_first():
+    assert [m.key for m in MODELS] == RANKED_KEYS
+    # instrumental models lead, speech and the least pleasant close the list
+    assert {m.key for m in MODELS[:4]} == {"solord", "solfull", "musicnet", "crozzoli"}
+    assert [m.key for m in MODELS[-2:]] == ["marine", "magnets"]
+
+
+def test_model_keys_avoid_the_tab_commands():
+    """r = re-read status, z = all off, digits = slot select, space/tab are
+    commands: none may be a model key. Home row first, in listing order."""
+    assert RAVE_MODEL_KEYS[:12] == "asdfghjkl;'\\"
+    assert not set(RAVE_MODEL_KEYS) & set("rz0123456789 \t")
 
 
 def test_parse_model_filename():
@@ -182,7 +216,7 @@ def test_level_and_placement_helpers():
     assert abs(dry_gain(True, 1, 0.7) - 0.3) < 1e-9
     assert per_model_amp(0.7, 0) == 0.0 and abs(per_model_amp(0.7, 1) - 0.7) < 1e-9
     assert abs(per_model_amp(0.7, 4) - 0.35) < 1e-9
-    assert model_pan(0) == -0.6 and model_pan(11) == 0.6 and abs(model_pan(5) + model_pan(6)) < 1e-9
+    assert model_pan(0) == -0.6 and model_pan(N - 1) == 0.6 and abs(model_pan(8) + model_pan(10)) < 1e-9
     assert model_pan(0, 1) == 0.0
 
 
@@ -207,19 +241,19 @@ def test_install_spawns_split_before_master_as_passthrough():
 def test_models_only_sound_when_layer_is_on():
     rec = Recorder(); layer = make_layer(rec, master_node=900, mix=0.7)
     layer.spawn_split(); rec.clear()
-    layer.toggle_model(0)                              # birds selected, layer OFF
+    layer.toggle_model(0)                              # first model selected, layer OFF
     assert layer.active[0] and rec.of("/s_new") == [], "no node while the layer is off"
     assert nset(rec.of("/n_set")[-1])["dry"] == 1.0
     rec.clear()
     layer.set_enabled(True)
     sn = rec.of("/s_new"); assert len(sn) == 1
-    assert sn[0][:4] == ["raveXfer_birds", MODEL_NODE_BASE + 0, 2, 900]
+    assert sn[0][:4] == ["raveXfer_" + MODELS[0].key, MODEL_NODE_BASE + 0, 2, 900]
     d = snew(sn[0])
     assert d["inBus"] == RAVE_BUS and d["out"] == 0 and d["gate"] == 1
     assert abs(d["amp"] - 0.7) < 1e-9 and d["pan"] == model_pan(0) and d["inGain"] == 1.0
     dry = [nset(a) for a in rec.of("/n_set") if a[0] == SPLIT_NODE][-1]["dry"]
     assert abs(dry - 0.3) < 1e-9
-    assert "RAVE on" in layer.hud_line() and "birds" in layer.hud_line()
+    assert "RAVE on" in layer.hud_line() and MODELS[0].key in layer.hud_line()
     rec.clear()
     layer.set_enabled(False)
     assert rec.of("/n_set")[0] == [MODEL_NODE_BASE, "gate", 0], "layer off gates the node (fade, self-free)"
@@ -231,21 +265,24 @@ def test_models_only_sound_when_layer_is_on():
 def test_bank_levels_follow_active_count():
     rec = Recorder(); layer = make_layer(rec, master_node=None, mix=0.8, enabled=True)
     layer.spawn_split()
-    layer.toggle_model(7)                              # organ
-    layer.toggle_model(11)                             # water
+    o, wt, g = idx("organ"), idx("water"), idx("guitar")
+    layer.toggle_model(o)
+    layer.toggle_model(wt)
     rec.clear()
     layer._push_amps()
     amps = {a[0]: nset(a)["amp"] for a in rec.of("/n_set")}
-    assert set(amps) == {MODEL_NODE_BASE + 7, MODEL_NODE_BASE + 11}
+    assert set(amps) == {MODEL_NODE_BASE + o, MODEL_NODE_BASE + wt}
     assert all(abs(v - 0.8 / math.sqrt(2)) < 1e-3 for v in amps.values())
     # placement without a master: tail of group 0
-    rec.clear(); layer.toggle_model(2)
-    assert rec.of("/s_new")[0][:4] == ["raveXfer_guitar", MODEL_NODE_BASE + 2, 1, 0]
+    rec.clear(); layer.toggle_model(g)
+    assert rec.of("/s_new")[0][:4] == ["raveXfer_guitar", MODEL_NODE_BASE + g, 1, 0]
     # toggling one off gates only that node and re-levels the rest
-    rec.clear(); layer.toggle_model(7)
-    assert rec.of("/n_set")[0] == [MODEL_NODE_BASE + 7, "gate", 0]
+    rec.clear(); layer.toggle_model(o)
+    assert rec.of("/n_set")[0] == [MODEL_NODE_BASE + o, "gate", 0]
     rest = {a[0] for a in rec.of("/n_set") if "amp" in nset(a)}
-    assert rest == {MODEL_NODE_BASE + 11, MODEL_NODE_BASE + 2}
+    assert rest == {MODEL_NODE_BASE + wt, MODEL_NODE_BASE + g}
+    # the last model's node stays below the bench range (950+)
+    assert MODEL_NODE_BASE + N - 1 < 950
     layer.all_off()
     assert layer.n_active == 0 and layer.spawned_nodes == {}
     assert nset(rec.of("/n_set")[-1])["dry"] == 1.0
@@ -296,8 +333,9 @@ def test_status_file_and_panel():
     assert rows[0][1] == "title" and "OFF" in rows[0][0]
     assert any("rave_status.json not found" in t for t, k in rows if k == "warn")
     model_rows = [r for r in rows if r[1] in ("on", "off", "unverified", "missing", "failed")]
-    assert len(model_rows) == 12 and all(r[1] == "unverified" for r in model_rows)
-    assert model_rows[0][0].startswith(" a  [ ]  birds")
+    assert len(model_rows) == N and all(r[1] == "unverified" for r in model_rows)
+    assert model_rows[0][0].startswith(" a  [ ]  SOL ordinario")
+    assert model_rows[12][0].startswith(" q  [ ]  birds")
     # SC writes the file: loaded / missing / failed and a 44.1 k mismatch
     write_status(path, loaded=["birds", "organ", "mrp"], missing=["water"], failed=["vctk"])
     layer._t[0] += 5.0; layer.update()
@@ -307,19 +345,20 @@ def test_status_file_and_panel():
     kinds = {k: layer.model_line(i, RAVE_MODEL_KEYS[i])[1] for i, k in enumerate(m.key for m in MODELS)}
     assert kinds["birds"] == "off" and kinds["water"] == "missing" and kinds["vctk"] == "failed"
     assert kinds["guitar"] == "unverified"
-    mrp_line = layer.model_line(6, "j")[0]
+    mrp_line = layer.model_line(idx("mrp"), "h")[0]
     assert "44k!" in mrp_line, mrp_line                      # trained at 44.1 k, server at 48 k
-    assert "48k " in layer.model_line(0, "a")[0] or "48k" in layer.model_line(0, "a")[0]
-    layer.toggle_model(0)
-    assert layer.model_line(0, "a")[1] == "on" and "[x]" in layer.model_line(0, "a")[0]
+    b = idx("birds")
+    assert "48k" in layer.model_line(b, "q")[0]
+    layer.toggle_model(b)
+    assert layer.model_line(b, "q")[1] == "on" and "[x]" in layer.model_line(b, "q")[0]
     assert layer.last_msg.endswith("on")
-    layer.toggle_model(11)
+    layer.toggle_model(idx("water"))
     assert "missing in SC" in layer.last_msg
     # a rewrite is picked up by the poll, an unchanged file is not re-read
     write_status(path, loaded=[m.key for m in MODELS])
     layer._t[0] += 5.0; layer.update()
     assert all(s.status == "loaded" for s in layer.status.models.values())
-    layer.reload_status(); assert "12 model(s) loaded" in layer.last_msg
+    layer.reload_status(); assert f"{N} model(s) loaded" in layer.last_msg
     # nn.ar absent is called out
     write_status(path, available=False)
     layer._t[0] += 5.0; layer.update()
@@ -358,8 +397,8 @@ def test_rave_tab_keys():
     for i, ch in enumerate(RAVE_MODEL_KEYS):
         press(pg, ch)
     evs = kb.poll()
-    assert [e.type for e in evs] == [RAVE_TOGGLE_MODEL] * 12
-    assert [e.extras["index"] for e in evs] == list(range(12))
+    assert [e.type for e in evs] == [RAVE_TOGGLE_MODEL] * N
+    assert [e.extras["index"] for e in evs] == list(range(N))
     press(pg, key=pg.K_SPACE); press(pg, "z"); press(pg, "r")
     evs = kb.poll()
     assert [e.type for e in evs] == [RAVE_TOGGLE, RAVE_ALL_OFF, RAVE_RELOAD]
@@ -370,7 +409,7 @@ def test_rave_tab_keys():
     assert [(e.param, e.value) for e in evs] == [("mix", 0.05), ("mix", -0.05), ("mix", 0.25),
                                                   ("mix", -0.25), ("in_gain", 0.5), ("in_gain", -0.5)]
     # number keys still select slots in the RAVE tab; key-ups and other keys do nothing
-    press(pg, "3"); press(pg, "a", up=True); press(pg, "q")
+    press(pg, "3"); press(pg, "a", up=True); press(pg, "x")
     evs = kb.poll()
     assert [e.type for e in evs] == [SELECT_SLOT] and kb.selected_slot == 2
     # and in PERFORMANCE the home row is still a piano
@@ -392,6 +431,40 @@ def test_layer_panel_renders_without_a_display():
     assert layer.enabled and layer.active[0]
     rows = kb.rave_panel()
     assert any(k == "on" for _t, k in rows) and rows[0][0].startswith("RAVE timbre transfer   ON")
+
+
+def test_rate_from_status_when_the_name_has_none():
+    """ACIDS files carry no rate in the name; SC's reported rate is used, so a
+    44.1 k model is flagged against the 48 k server."""
+    d = tempfile.mkdtemp(); path = os.path.join(d, "rave_status.json")
+    rec = Recorder(); layer = make_layer(rec, status=path)
+    i = idx("musicnet")
+    assert MODELS[i].rate is None and " ?k" in layer.model_line(i, "d")[0]
+    write_status(path, loaded=["musicnet"])
+    with open(path) as f:
+        raw = json.load(f)
+    raw["models"]["musicnet"]["rate"] = 44100
+    with open(path, "w") as f:
+        json.dump(raw, f)
+    layer.reload_status()
+    assert "44k!" in layer.model_line(i, "d")[0]
+
+
+def test_panel_fits_the_default_window_in_two_columns():
+    rec = Recorder(); layer = make_layer(rec)
+    rows = layer.panel_lines() + [("TAB  return to PERFORMANCE", "tab")]
+    placed = rave_panel_layout(rows, 880, 440)
+    models = [e for e in placed if e[1] in RAVE_MODEL_KINDS]
+    assert len(models) == N, "every model row is drawn"
+    xs = sorted({e[2] for e in models})
+    assert len(xs) == 2, "two columns at 880 x 440"
+    left = [e for e in models if e[2] == xs[0]]
+    assert [e[0][1] for e in left] == list(RAVE_MODEL_KEYS[:len(left)]), "left column first, in order"
+    assert all(e[3] <= 440 - 44 for e in placed)
+    assert placed[-1][0].startswith("TAB"), "hints and the TAB line still fit"
+    # a tall window keeps one column
+    tall = rave_panel_layout(rows, 880, 900)
+    assert len({e[2] for e in tall}) == 1 and len(tall) == len(rows)
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
