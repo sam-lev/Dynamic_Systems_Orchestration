@@ -194,7 +194,7 @@ def test_reset_learning_surface():
     # an arrow press does the same
     g.handle_controller_event(ControllerEvent(SET_PARAM, param="gov.grouping.reset_learning",
                                               value=1.0, extras={"relative": True}))
-    check(g.grouping.n_resets == 2, "arrow key also resets")
+    check(g.grouping.n_resets == 1, "arrow key does NOT reset (v4.9.5: a held arrow fired 12 resets live)")
     check(g.weights.get("grouping.reset_learning", -1.0) == -1.0, "nothing written to the weight store")
     for p in ("gov.grouping.phrase_floor_secs", "gov.grouping.hazard_cap_per_sec"):
         check(p in EDIT_FAMILIES["gov"] and p in EDIT_STEP_FINE, f"{p} on the surface")
@@ -521,11 +521,45 @@ def test_timed_hits():
           or True, "immediate send only in the fallback")
 
 
+# ── 9. the ascent whistle (v4.9.4) ────────────────────────────────────────────
+def test_ascent_whistle():
+    print("[whistle] rising no longer morphs to high-pass; unmatched depth is 0; resonance capped under HP")
+    from routing import DEFAULT_BLOB_ROUTING, Source, Dest, extract_source_value
+    r = {(x.src, x.dest): x for x in DEFAULT_BLOB_ROUTING}
+    check((Source.VY, Dest.FMODE) not in r, "VY -> FMODE removed")
+    check((Source.VY, Dest.CUTOFF) in r and r[(Source.VY, Dest.CUTOFF)].depth < 0, "VY -> CUTOFF with negative depth (rising opens)")
+    check(len(DEFAULT_BLOB_ROUTING) == 24, "routing count unchanged")
+    # unmatched blob -> score_depth 0, matched blob -> its own depth
+    fps = 30
+    g = governor("depth", fps)
+    blobs = osc_blobs(0, fps)
+    g._tree_features = lambda root, leaves, bl: ({0: 1}, 3, 0.0, {"max_depth": 3})
+    g.update(blobs, 1 / fps, tree_root=object())
+    check(abs(blobs[0].score_depth - 1 / 3) < 1e-9, "matched blob keeps its depth (1/3)")
+    check(blobs[1].score_depth == 0.0 and blobs[2].score_depth == 0.0, "unmatched blobs stamp depth 0 (was max -> +12 semitones)")
+    # resonance cap while the filter is high-pass
+    import voice_manager
+    from lamp_profile import LampProfile
+    vm = voice_manager.VoiceManager.__new__(voice_manager.VoiceManager)
+    voice_manager.VoiceManager.__init__(vm, n_slots=2, profile=LampProfile.default())
+    class _OSC:
+        def send_message(self, *a): pass
+        def send(self, *a): pass
+    vm.osc = _OSC()
+    v = vm.voice(0)
+    v.state = voice_manager.VoiceState.KEYBOARD_ONLY
+    v.synth.base_res = 0.95
+    for fm, want in ((0.0, 0.95), (0.5, 0.95), (1.0, 0.45), (0.75, 0.725)):
+        v.synth.fmode = fm
+        vm._compute_targets(v, {})
+        check(abs(v.synth.t_res - want) < 1e-6, f"fmode {fm}: res {v.synth.t_res:.2f} (want {want})")
+
+
 if __name__ == "__main__":
     for t in (test_lifecycle_gate, test_effective_count, test_count_change_rule,
               test_reset_learning_surface, test_pattern_from_period, test_pattern_smoothing,
               test_clock_bar_phase, test_field_scale, test_scale_latch, test_onset_pull,
-              test_pitch_knobs, test_timed_hits):
+              test_pitch_knobs, test_timed_hits, test_ascent_whistle):
         try:
             t()
         except Exception as e:

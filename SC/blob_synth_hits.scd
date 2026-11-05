@@ -17,6 +17,8 @@
 // NOTE: stock UGens only (no plugins). \mpeVoice's header comment says "SVF"
 // but its code uses RLPF/BPF/RHPF + SelectX; this file follows the code.
 //
+// for when restarting the server, leave commented out
+// Server.killAll;
 (
 SynthDef(\mpeHit, {
     |out    = 0,

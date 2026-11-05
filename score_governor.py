@@ -1,4 +1,4 @@
-# score_governor.py -- Audible Lava / DSO v4.9.3
+# score_governor.py -- Audible Lava / DSO v4.9.5
 # Topological score grammar: the governor layer.
 #
 # Reads (never writes): tracked blobs, the corrected merge tree, the H0
@@ -314,6 +314,19 @@ class MeterModule(PreferenceRuleModule):
     def candidate_key(self, c):
         return (round(c["period"], 2), c["beats"])
 
+    # v4.9.5: candidate periods are continuous and re-estimated every frame,
+    # so exact keys almost never repeat. Two candidates within 6 % in period
+    # (a tenth of a semitone's worth is far below what a listener hears as a
+    # tempo change) with the same beat count are the same hypothesis, and the
+    # committed one keeps its own period until a different one wins.
+    PERIOD_TOL = 0.06
+    keep_incumbent_value = True
+
+    def same_candidate(self, a, b):
+        if a is None or b is None or a["beats"] != b["beats"]:
+            return False
+        return abs(math.log(max(a["period"], 1e-6) / max(b["period"], 1e-6))) < self.PERIOD_TOL
+
 
 class MeterParticleFilter(ParticleFilterModule):
     name = "meter_pf"
@@ -345,8 +358,12 @@ class HarmonyModule(PreferenceRuleModule):
             cands.append({"triad": t, "op": op, "dist_from_current": len(op),
                           "dist_home_delta": int(np.sign(tonnetz_distance(t, self.walker.home) - d0)),
                           "pcs": t.pcs()})
-        cands.sort(key=lambda c: -self.score(ev, c))
-        return cands[: self.beam_size]
+        # v4.9.5: rank the MOVES by score but always keep the stay-put
+        # candidate (cands[0]); truncating the whole sorted list dropped the
+        # current triad whenever two neighbours outscored it on one frame.
+        stay, moves = cands[0], cands[1:]
+        moves.sort(key=lambda c: -self.score(ev, c))
+        return [stay] + moves[: self.beam_size - 1]
 
     def candidate_key(self, c):
         return c["triad"].name
@@ -971,7 +988,12 @@ class ScoreGovernor:
             b.score_beat_phase = s.beat_phase
             b.score_surprisal = surpr_norm
             b.score_ambiguity = s.ambiguity
-            b.score_depth = depth_of.get(b.id, max_depth) / max(max_depth, 1) if max_depth else 0.0
+            # v4.9.4: a blob the tree could not place (no leaf within 30 px,
+            # or a non-detection frame) used to be stamped at MAX depth, so
+            # routing's DEPTH -> PITCH +12 lifted every unmatched -- typically
+            # small, fast, freshly born -- blob a full octave, and dropped it
+            # back on the frames it did match. Unknown depth is now 0.
+            b.score_depth = (depth_of[b.id] / max(max_depth, 1)) if (b.id in depth_of and max_depth) else 0.0
             b.score_role_weight = max(self.roles.get(r, {}).get(str(b.id), 0.0) for r in ROLES) if self.roles else 0.0
 
         self.state = s
@@ -1032,7 +1054,8 @@ class ScoreGovernor:
           * a DELTA when extras['relative'] is set (the keyboard's arrow keys)
           * snap back to the hand-set default when extras['reset'] is set
           * 'gov.grouping.reset_learning' (v4.9.3) is an ACTION, not a value:
-            any event addressed to it restores the phrase prior live.
+            a reset event (the `r` key) restores the phrase prior live;
+            arrows on it are consumed and do nothing.
         Returns True if consumed, so the event never reaches VoiceManager.
         """
         p = getattr(ev, "param", None)
@@ -1043,9 +1066,13 @@ class ScoreGovernor:
         extras = getattr(ev, "extras", None) or {}
 
         if path == "grouping.reset_learning":
-            self.grouping.reset_learning()
-            self.last_edit = (path, float(self.grouping.n_resets))
-            self.weights.maybe_write(self.runtime_state(), force=True)
+            # v4.9.5: only the controller's `r` (extras reset) fires it. Arrow
+            # presses used to as well, and a held arrow produced twelve resets
+            # in four seconds in a logged run.
+            if extras.get("reset"):
+                self.grouping.reset_learning()
+                self.last_edit = (path, float(self.grouping.n_resets))
+                self.weights.maybe_write(self.runtime_state(), force=True)
             return True
 
         if extras.get("reset"):

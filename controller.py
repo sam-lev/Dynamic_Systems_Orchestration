@@ -1,4 +1,17 @@
-# controller.py -- Audible Lava / DSO v4.0 (MPE Edition)
+# controller.py -- Audible Lava / DSO v4.11 (MPE Edition)
+#
+# v4.11: a third tab, RAVE. TAB now cycles PERFORMANCE -> EDIT -> RAVE ->
+# PERFORMANCE once the main loop has installed a RAVE panel
+# (enable_rave_tab); without one TAB toggles the two modes exactly as before.
+# In the RAVE tab the home row (a s d f g h j k l ; ' \) toggles one of the
+# twelve pre-trained timbre-transfer models each, SPACE switches the whole
+# layer on/off, Z clears every model, R re-reads the status file SuperCollider
+# writes, up/down nudge the wet mix and left/right the input gain. The tab
+# only emits ControllerEvents (RAVE_*); rave_layer.py acts on them.
+#
+# v4.9.5: the EDIT window lists the current family's options with a one-line
+# description each (FAMILY_DOCS / PARAM_DOCS), names the keys that switch
+# family, and opens at 880x440 so descriptions fit inline.
 #
 # Player-input abstraction layer. The VoiceManager and BindingManager only
 # ever see ControllerEvent objects produced by a Controller.poll() call;
@@ -11,8 +24,9 @@
 # MIDIController (mido) and the LearnMode workflow on the same protocol.
 #
 # v4.9.3: the `gov` EDIT family gains gov.grouping.reset_learning (an
-# ACTION: select it and press `r` -- or any arrow -- to restore the phrase
-# prior live; the HUD value shows how many resets have been done), plus the
+# ACTION: select it and press `r` to restore the phrase prior live -- v4.9.5:
+# arrows no longer trigger it, a held arrow fired twelve resets in a logged
+# run; the HUD value shows how many resets have been done), plus the
 # two new duration guards gov.grouping.phrase_floor_secs and
 # gov.grouping.hazard_cap_per_sec.
 
@@ -21,7 +35,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Protocol, Iterable
+from typing import Callable, Optional, Protocol, Iterable
 
 # ── ControllerEvent ──────────────────────────────────────────────────────────
 # The lingua franca between Controller adapters and the VoiceManager.
@@ -53,8 +67,15 @@ from typing import Optional, Protocol, Iterable
 #     LEARN_ARM         slot, param   # next incoming CC binds to this
 #     LEARN_CLEAR       slot, param
 #
+#   RAVE timbre transfer (v4.11; handled by rave_layer, never by VoiceManager):
+#     RAVE_TOGGLE_MODEL extras.index  # one of the pre-trained models on/off
+#     RAVE_TOGGLE       (no fields)   # whole layer on/off
+#     RAVE_SET          param, value  # "mix" | "in_gain", relative delta
+#     RAVE_ALL_OFF      (no fields)
+#     RAVE_RELOAD       (no fields)   # re-read rave_status.json
+#
 #   System:
-#     MODE_TOGGLE       (no fields; PERFORMANCE <-> EDIT)
+#     MODE_TOGGLE       (no fields; PERFORMANCE <-> EDIT <-> RAVE)
 #     QUIT              (no fields)
 #
 # The 'value' field is overloaded: for SET_PARAM it carries the new param
@@ -78,6 +99,12 @@ OCTAVE_UP     = "OCTAVE_UP"
 OCTAVE_DOWN   = "OCTAVE_DOWN"
 MODE_TOGGLE   = "MODE_TOGGLE"
 QUIT          = "QUIT"
+# v4.11
+RAVE_TOGGLE_MODEL = "RAVE_TOGGLE_MODEL"
+RAVE_TOGGLE       = "RAVE_TOGGLE"
+RAVE_SET          = "RAVE_SET"
+RAVE_ALL_OFF      = "RAVE_ALL_OFF"
+RAVE_RELOAD       = "RAVE_RELOAD"
 
 
 @dataclass
@@ -128,11 +155,25 @@ class Controller(Protocol):
 #   c              clear all routings on selected slot
 #   tab            return to PERFORMANCE
 #
+# RAVE mode (v4.11; TAB from EDIT, only when enable_rave_tab was called):
+#   a s d f g h j k l ; ' \   toggle model 0..11 (home row, listing order)
+#   space          whole RAVE layer on/off
+#   z              all models off
+#   r              re-read rave_status.json (after re-evaluating the .scd)
+#   up/down        wet mix +/- 0.05        - / =   wet mix +/- 0.25
+#   left/right     input gain / x 1.41
+#   1..0           still select slot
+#   tab            return to PERFORMANCE
+#
 # This module imports pygame lazily so that the rest of the project can be
 # imported on machines without pygame installed (e.g. for unit tests).
 
 PERFORMANCE_MODE = "PERFORMANCE"
 EDIT_MODE        = "EDIT"
+RAVE_MODE        = "RAVE"           # v4.11
+
+# v4.11: RAVE tab home row, one key per model in rave_layer.MODELS order.
+RAVE_MODEL_KEYS  = "asdfghjkl;'\\"
 
 # Map from QWERTY home/upper rows to MIDI offset within the current octave.
 # Layout is "piano-style" wrapped onto two rows; ';' = high B, "'" = high C.
@@ -241,6 +282,55 @@ EDIT_STEP_FINE = {
 }
 EDIT_STEP_COARSE = {k: v * 10.0 for k, v in EDIT_STEP_FINE.items()}
 
+# ── Descriptions for the EDIT surface (v4.9.5) ───────────────────────────────
+# One short line per family and per parameter, shown next to the option list
+# when the window is wide enough and under the selected option otherwise.
+FAMILY_KEYS = [("p", "pitch"), ("w", "wave"), ("e", "env"), ("f", "filter"), ("m", "mod"), ("g", "gov")]
+FAMILY_DOCS = {
+    "pitch":  "base note, bend, Hz nudge, scale, chord of the selected slot",
+    "wave":   "wavetable position and bank of the selected slot",
+    "env":    "attack / decay / sustain / release of the selected slot",
+    "filter": "cutoff, resonance, LP-BP-HP morph of the selected slot",
+    "mod":    "walk the slot's routing list; up/down nudges depth",
+    "gov":    "score-governor weights (global); r resets one to its default",
+}
+PARAM_DOCS = {
+    "base_note":   "MIDI note of the voice (semitones)",
+    "bend":        "pitch bend in cents",
+    "freq_hz":     "linear Hz offset applied after routing",
+    "scale_id":    "scale used for quantising keyboard notes",
+    "chord_id":    "chord voicing for keyboard notes",
+    "wave_pos":    "position within the wavetable bank (0..1)",
+    "wave_bank":   "which wavetable bank (0..3)",
+    "attack":      "envelope attack, seconds",
+    "decay":       "envelope decay, seconds",
+    "sustain":     "envelope sustain level (0..1)",
+    "release":     "envelope release, seconds",
+    "cutoff":      "filter cutoff, Hz",
+    "res":         "filter resonance (0..1; capped under high-pass)",
+    "fmode":       "filter morph: 0 low-pass, 0.5 band-pass, 1 high-pass",
+    "routing_cursor": "selected routing; up/down changes its depth",
+    "gov.grouping.prior_phrase_secs":  "prior phrase length, s (learned mean starts here)",
+    "gov.grouping.reset_learning":     "R = forget learned phrases, restore prior (value = resets so far)",
+    "gov.grouping.phrase_floor_secs":  "learned phrase mean never drops below this, s",
+    "gov.grouping.hazard_cap_per_sec": "max boundary probability per second when overdue",
+    "gov.grouping.evidence_rate":      "how fast the evidence null (median/MAD) tracks",
+    "gov.grouping.rules.saddle":       "weight: merge-tree saddle events as boundary cues",
+    "gov.grouping.rules.changepoint":  "weight: Bayesian changepoint posterior on signals",
+    "gov.grouping.rules.change":       "weight: abrupt z-scored change in energy/flux/etc",
+    "gov.meter.pf_mix":                "0 = beam period, 1 = particle-filter period",
+    "gov.meter.switch_cost":           "hysteresis against changing the committed meter",
+    "gov.meter.rules.periodicity":     "weight: autocorrelation support for a period",
+    "gov.roles.temperature":           "softmax sharpness of role weights (low = winner-take-all)",
+    "gov.roles.virtual_signal_bias":   "how much system signals compete with blobs for roles",
+    "gov.prolongation.smoothing":      "tension smoothing (0.92 = slow, 0.5 = twitchy)",
+    "gov.prolongation.rules.surprisal":     "weight of Markov surprisal in tension",
+    "gov.prolongation.rules.w_equilibrium": "weight of distance-from-equilibrium in tension",
+    "gov.harmony.step_rate_gain":      "how fast topological change licenses a Tonnetz step",
+    "gov.harmony.rules.direction":     "weight: move away from / toward home with equilibrium",
+    "gov.timespan.rules.surface":      "weight: on-beat and in-field tones gain prominence",
+}
+
 
 class KeyboardController:
     """
@@ -251,7 +341,7 @@ class KeyboardController:
     the controller still constructs and just returns no events.
     """
 
-    def __init__(self, *, init_display: bool = True, window_size=(580, 360),
+    def __init__(self, *, init_display: bool = True, window_size=(880, 440),
                  caption="DSO v4.0 — keyboard controller"):
         import pygame  # lazy import
         pygame.init()
@@ -294,10 +384,37 @@ class KeyboardController:
         self._pressed_notes: dict[str, int] = {}   # key_char -> MIDI note
         self._n_slots = 16
 
+        # v4.11: the RAVE tab. Off until the main loop installs a panel
+        # (enable_rave_tab); TAB then cycles through three modes.
+        self.rave_panel: Optional[Callable[[], list]] = None
+        self.rave_model_keys: str = RAVE_MODEL_KEYS
+
         # Public state read by the HUD overlay
         self.last_event_msg: str = ""
 
     # ── Helpers ──────────────────────────────────────────────────────────
+    def enable_rave_tab(self, panel: Callable[[], list],
+                        model_keys: str = RAVE_MODEL_KEYS) -> None:
+        """Install the RAVE tab. `panel()` returns [(text, kind)] rows for the
+        window (rave_layer.RaveLayer.panel_lines); `model_keys` maps home-row
+        characters to model indices in order."""
+        self.rave_panel = panel
+        self.rave_model_keys = model_keys
+
+    def _mode_cycle(self) -> list[str]:
+        modes = [PERFORMANCE_MODE, EDIT_MODE]
+        if self.rave_panel is not None:
+            modes.append(RAVE_MODE)
+        return modes
+
+    def _next_mode(self) -> str:
+        cyc = self._mode_cycle()
+        try:
+            i = cyc.index(self.mode)
+        except ValueError:
+            return PERFORMANCE_MODE
+        return cyc[(i + 1) % len(cyc)]
+
     def _current_param_name(self) -> str:
         params = EDIT_FAMILIES[self.current_family]
         if not params:
@@ -338,16 +455,17 @@ class KeyboardController:
                 ch = ""
             ch = ch.lower()
 
-            # --- Mode toggle (works in both modes) -----------------------
+            # --- Mode toggle (works in every mode) -----------------------
+            # v4.11: cycles PERFORMANCE -> EDIT -> RAVE -> PERFORMANCE when
+            # the RAVE tab is enabled, else PERFORMANCE <-> EDIT as before.
             if ev.type == pg.KEYDOWN and ev.key == pg.K_TAB:
-                self.mode = (EDIT_MODE if self.mode == PERFORMANCE_MODE
-                             else PERFORMANCE_MODE)
+                self.mode = self._next_mode()
                 self._emit(events,
                            ControllerEvent(MODE_TOGGLE),
                            f"mode -> {self.mode}")
                 continue
 
-            # --- Slot select (works in both modes) -----------------------
+            # --- Slot select (works in every mode) -----------------------
             if ev.type == pg.KEYDOWN and ch in _SLOT_KEYS:
                 slot = _SLOT_KEYS[ch]
                 # PERFORMANCE: number keys are slot select, period.
@@ -357,6 +475,44 @@ class KeyboardController:
                 self._emit(events,
                            ControllerEvent(SELECT_SLOT, slot=slot, value=slot),
                            f"slot -> {slot}")
+                continue
+
+            # --- RAVE-tab keys (v4.11) -----------------------------------
+            if self.mode == RAVE_MODE:
+                if ev.type == pg.KEYDOWN:
+                    if ch and ch in self.rave_model_keys:
+                        idx = self.rave_model_keys.index(ch)
+                        self._emit(events,
+                                   ControllerEvent(RAVE_TOGGLE_MODEL,
+                                       extras={"index": idx}),
+                                   f"RAVE model {idx} toggle")
+                        continue
+                    if ev.key == pg.K_SPACE:
+                        self._emit(events, ControllerEvent(RAVE_TOGGLE),
+                                   "RAVE layer toggle")
+                        continue
+                    if ch == "z":
+                        self._emit(events, ControllerEvent(RAVE_ALL_OFF),
+                                   "RAVE all models off")
+                        continue
+                    if ch == "r":
+                        self._emit(events, ControllerEvent(RAVE_RELOAD),
+                                   "RAVE re-read status")
+                        continue
+                    delta = None; pname = None
+                    if   ev.key == pg.K_UP:     pname, delta = "mix", +0.05
+                    elif ev.key == pg.K_DOWN:   pname, delta = "mix", -0.05
+                    elif ev.key == pg.K_EQUALS: pname, delta = "mix", +0.25
+                    elif ev.key == pg.K_MINUS:  pname, delta = "mix", -0.25
+                    elif ev.key == pg.K_RIGHT:  pname, delta = "in_gain", +0.5   # log2 steps
+                    elif ev.key == pg.K_LEFT:   pname, delta = "in_gain", -0.5
+                    if pname is not None:
+                        self._emit(events,
+                                   ControllerEvent(RAVE_SET, param=pname, value=delta,
+                                                   extras={"relative": True}),
+                                   f"RAVE {pname} {delta:+.2f}")
+                        continue
+                # key-ups and unmapped keys do nothing in this tab
                 continue
 
             # --- PERFORMANCE-mode keys -----------------------------------
@@ -534,6 +690,7 @@ class KeyboardController:
         LAVA_HI  = (255, 179, 71)
         TEAL     = (93, 210, 199)
         LINE     = (42, 53, 80)
+        ROSE     = (240, 110, 140)      # v4.11: missing / failed models
 
         try:
             self._screen.fill(BG)
@@ -543,11 +700,14 @@ class KeyboardController:
             pg.draw.rect(self._screen, LAVA, (16, 12, 32, 2))
             pg.draw.line(self._screen, LINE, (16, 24), (w - 16, 24), 1)
 
-            # Mode indicator (big)
-            mode_color = LAVA_HI if self.mode == EDIT_MODE else LAVA
+            # Mode indicator (big); v4.11: tab strip names all modes
+            mode_color = {EDIT_MODE: LAVA_HI, RAVE_MODE: TEAL}.get(self.mode, LAVA)
             mode_surf = self._font_big.render(
                 f"[{self.mode}]", True, mode_color)
             self._screen.blit(mode_surf, (16, 32))
+            tabs = "   ".join(m if m == self.mode else m.lower() for m in self._mode_cycle())
+            tab_surf = self._font_small.render(f"TAB:  {tabs}", True, TEXT_DIM)
+            self._screen.blit(tab_surf, (16 + mode_surf.get_width() + 24, 38))
 
             # Slot + octave (top right)
             info = f"slot S{self.selected_slot:02d}    oct {self.octave}"
@@ -557,6 +717,7 @@ class KeyboardController:
 
             # Mode-specific body
             y = 76
+            line_h = 16
             if self.mode == PERFORMANCE_MODE:
                 lines = [
                     ("Notes:", TEXT_DIM, self._font_small),
@@ -570,35 +731,79 @@ class KeyboardController:
                     ("1 - 0   select slot 0..9",      TEXT_DIM, self._font_small),
                     ("TAB     enter EDIT mode",       TEAL,     self._font_small),
                 ]
+            elif self.mode == RAVE_MODE:
+                # v4.11: the RAVE panel comes from rave_layer; kinds -> colours
+                kind_col = {"title": TEAL, "on": LAVA_HI, "off": TEXT, "missing": ROSE,
+                            "failed": ROSE, "unverified": TEXT_DIM, "warn": ROSE,
+                            "hint": TEXT_DIM, "": None}
+                rows = []
+                try:
+                    rows = list(self.rave_panel()) if self.rave_panel is not None else []
+                except Exception:
+                    rows = [("RAVE panel error", "warn")]
+                lines = []
+                for text, kind in rows:
+                    if not text:
+                        lines.append(("", None, None)); continue
+                    font = self._font_med if kind == "title" else (
+                        self._font_small if kind in ("hint", "warn") else self._font_mono)
+                    lines.append((text, kind_col.get(kind, TEXT), font))
+                lines.append(("TAB  return to PERFORMANCE", TEAL, self._font_small))
             else:  # EDIT
+                # v4.9.5: option list with descriptions. Top line names the
+                # keys that change the family; then the family's own
+                # description; then the parameters of the family as a list
+                # with the selected one highlighted, a window of up to 7
+                # around the selection. A wide window (>= 760 px) shows each
+                # option's description inline; a narrow one shows only the
+                # selected option's description, under the list.
+                params = EDIT_FAMILIES.get(self.current_family, [])
                 pname = self._current_param_name()
+                fam_line = "  ".join(f"{k.upper()}:{name}" for k, name in FAMILY_KEYS)
                 lines = [
-                    (f"family:  {self.current_family}",
+                    (f"family keys   {fam_line}", TEXT_DIM, self._font_small),
+                    (f"{self.current_family}:  {FAMILY_DOCS.get(self.current_family, '')}",
                      TEAL, self._font_med),
-                    (f"param:   {pname}",
-                     LAVA_HI, self._font_med),
                     ("", None, None),
-                    ("<- / ->  cycle parameter within family",
+                ]
+                wide = w >= 840
+                if params:
+                    sel = self.current_param_idx % len(params)
+                    win = min(7, len(params))
+                    lo = max(0, min(sel - win // 2, len(params) - win))
+                    if lo > 0:
+                        lines.append(("   ...", TEXT_DIM, self._font_small))
+                    for i in range(lo, lo + win):
+                        p = params[i]
+                        label = p[4:] if p.startswith("gov.") else p
+                        step = EDIT_STEP_FINE.get(p, 0.05)
+                        mark = ">" if i == sel else " "
+                        txt = f" {mark} {label:<30} step {step:g}"
+                        if wide:
+                            txt += f"   {PARAM_DOCS.get(p, '')}"
+                        lines.append((txt, LAVA_HI if i == sel else TEXT,
+                                      self._font_mono))
+                    if lo + win < len(params):
+                        lines.append(("   ...", TEXT_DIM, self._font_small))
+                    lines.append(("", None, None))
+                    lines.append((f"   {pname}:  {PARAM_DOCS.get(pname, '')}", TEAL, self._font_small))
+                lines += [
+                    ("", None, None),
+                    ("<-/->  option    up/dn  fine    +/-  coarse x10    R  reset",
                      TEXT_DIM, self._font_small),
-                    ("up / dn  fine adjust  (+/- = coarse, x10)",
+                    ("B claim hybrid   N create empty   T tie blob   D detach   C clear routings",
                      TEXT_DIM, self._font_small),
-                    ("",  None, None),
-                    ("B  claim hybrid     N  create empty",
-                     TEXT, self._font_small),
-                    ("T  tie blob         D  detach",
-                     TEXT, self._font_small),
-                    ("R  reset param      C  clear routings",
-                     TEXT, self._font_small),
-                    ("",  None, None),
-                    ("TAB  return to PERFORMANCE",
-                     TEAL, self._font_small),
+                    (("TAB  next: RAVE tab" if self.rave_panel is not None
+                      else "TAB  return to PERFORMANCE"), TEAL, self._font_small),
                 ]
 
             for text, color, font in lines:
+                if y > h - 44:
+                    break                                   # keep the bottom strip clear
                 if text and font is not None and color is not None:
                     surf = font.render(text, True, color)
                     self._screen.blit(surf, (16, y))
-                y += 18
+                y += line_h
 
             # Last event message (bottom strip)
             pg.draw.line(self._screen, LINE,

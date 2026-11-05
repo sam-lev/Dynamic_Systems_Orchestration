@@ -1,0 +1,23 @@
+{
+  "wax_hue_lo": 175,
+  "wax_hue_hi": 9,
+  "wax_sat_min": 235,
+  "wax_val_min": 18,
+  "lamp_x1": 377,
+  "lamp_y1": 129,
+  "lamp_x2": 715,
+  "lamp_y2": 608,
+  "blob_area_min": 4165.0,
+  "blob_area_max": 38278.0,
+  "n_blobs_expected": 4,
+  "frame_h": 720,
+  "frame_w": 1280,
+  "detect_interval": 1,
+  "rising_hue_threshold": 4.099999999999994,
+  "falling_hue_threshold": 179.9,
+  "observed_hue_min": 0.0,
+  "observed_hue_max": 179.0,
+  "observed_hue_mean": 1.0931007877276002,
+  "expected_persistence_mean": 15,
+  "expected_persistence_std": 3.0
+}

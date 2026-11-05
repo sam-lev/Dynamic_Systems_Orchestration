@@ -1,5 +1,19 @@
 # routing.py -- Audible Lava / DSO v4.0 (MPE Edition)
 #
+# v4.10.1 (Nov 2026) -- Source.Y_NORM fixed to mean what it says.
+#   extract_source_value(Source.Y_NORM) returned 1.0 - profile.y_norm(y), but
+#   LampProfile.y_norm already returns 1 = top of lamp (lamp_profile.py:
+#   "Normalise an ROI-local y to [0=bottom, 1=top]"). The second inversion
+#   made Y_NORM read 1 at the BOTTOM, so the Y_NORM -> PITCH +7 routing lifted
+#   blobs near the bottom and dropped a rising blob by a fifth -- the opposite
+#   of the behaviour documented below ("a blob born at the bottom and rising
+#   to the top climbs a fifth"). The spawn pitch was unaffected
+#   (voice_manager._init_voice_from_blob inverts y_norm and y_to_midi inverts
+#   again, so top = high), which is why the drone's register could drift
+#   against its own spawn note and against the melody layer, which reads
+#   profile.y_norm directly. Y_NORM now returns profile.y_norm as is.
+#   Nothing else here changed; no routing depth was retuned.
+#
 # The bridge between blob CV features (sources) and voice synth parameters
 # (destinations). Each Voice carries a list of Routing(src, dst, depth, curve)
 # tuples; every frame the runtime reads the bound blob's normalised feature,
@@ -202,7 +216,7 @@ class EventRoute:
 # change-of-state mappings so a voice tracks not just *where* a blob is but
 # *how it is moving and changing shape/topology*. The aesthetic logic:
 #
-#   rising (vy<0)        → filter opens / brightens   (VY → FMODE, -)
+#   rising (vy<0)        → filter opens / brightens   (VY → CUTOFF, -; v4.9.4, was FMODE)
 #   speed (|v|)          → brighter + wider/detuned    (SPEED → CUTOFF, DETUNE)
 #   elongation (stretch) → resonance + beating         (ELONGATION → RES, DETUNE)
 #   expanding (d_area>0) → swells louder + richer/folded(D_AREA → AMP, DRIVE)
@@ -229,7 +243,14 @@ DEFAULT_BLOB_ROUTING: list[Routing] = [
     Routing(src=Source.D_AREA,        dest=Dest.AMP,      depth=+0.12, curve=Curve.LIN),
     Routing(src=Source.D_PERSISTENCE, dest=Dest.NOISE,    depth=-0.60, curve=Curve.LIN),
     Routing(src=Source.ACCEL,         dest=Dest.SHIMMER,  depth=+0.70, curve=Curve.SQRT),
-    Routing(src=Source.VY,            dest=Dest.FMODE,    depth=-0.70, curve=Curve.LIN),
+    # v4.9.4: was VY -> FMODE -0.70. "Rising brightens" was implemented as a
+    # morph toward HIGH-PASS, which removes the fundamental and -- together
+    # with SPEED -> CUTOFF and ELONGATION -> RES on the same fast, stretched,
+    # rising blob -- left only a resonant peak sliding up with speed: the
+    # shrill whistle on ascents. Brightening is a cutoff rise, so it is now
+    # one (vy < 0 when rising, hence the negative depth -> +900 Hz at full
+    # rise); the filter mode is left alone.
+    Routing(src=Source.VY,            dest=Dest.CUTOFF,   depth=-900.0, curve=Curve.LIN),
     # — v4.4 governor set —
     # Without these the governor computes tension, meter and prominence every
     # frame and NOTHING listens: the eight governor Sources existed in the enum
@@ -266,7 +287,8 @@ def extract_source_value(src: Source, blob, profile, *, age_norm_max: int = 600)
         (VY, ORIENTATION).
 
     Notes:
-        - Y_NORM is inverted vs raw image: y_norm=1 means top of the lamp.
+        - Y_NORM is LampProfile.y_norm as is: 1 = top of the lamp, 0 = bottom
+          (v4.10.1; it was inverted a second time before, see the header).
         - persistence is divided by expected_persistence_mean * 4 as a
           working ceiling; clipped to [0,1].
         - area is divided by blob_area_max (from profile) and clipped.
@@ -275,7 +297,9 @@ def extract_source_value(src: Source, blob, profile, *, age_norm_max: int = 600)
         - age uses coast_frames + age (total observed frames) bounded.
     """
     if src is Source.Y_NORM:
-        return 1.0 - profile.y_norm(blob.centroid[1])
+        # v4.10.1: profile.y_norm already returns 1 = top (lamp_profile.py);
+        # the former `1.0 - ...` made this source 1 at the bottom.
+        return max(0.0, min(float(profile.y_norm(blob.centroid[1])), 1.0))
     if src is Source.X_NORM:
         return profile.x_norm(blob.centroid[0])
     if src is Source.VY:

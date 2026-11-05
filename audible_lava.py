@@ -1,5 +1,49 @@
 #!/usr/bin/env python3
-# audible_lava.py -- Audible Lava / DSO v4.9.4 (MPE Edition)
+# audible_lava.py -- Audible Lava / DSO v4.11 (MPE Edition)
+#
+# v4.10.3 (Nov 2026): 'k' on the video window respawns the master space
+#   (MasterSpace.respawn) to clear its reverb / Greyhole state if a bad value
+#   ever silences the tails. See blob_synth_rich.scd v4.10.3.
+#
+# v4.11 (Nov 2026): RAVE timbre-transfer layer (rave_layer.py +
+#   blob_synth_rave.scd, via the nn.ar SuperCollider extension). RAVE =
+#   Realtime Audio Variational autoEncoder (IRCAM).
+#   - A final stage after the fully formed lava mix: \raveSplit (node 910)
+#     copies bus 0 to a private bus and scales the dry mix; one
+#     \raveXfer_<key> node per ACTIVE pre-trained model re-synthesises that
+#     copy through its own timbre and adds it back to bus 0. Both sit BEFORE
+#     \lavaMaster, so the space hears the transferred timbre.
+#   - OFF by default: the lamp plays the rich SynthDefs untouched. The
+#     keyboard window gains a third tab, RAVE (TAB cycles PERFORMANCE ->
+#     EDIT -> RAVE): the home row toggles each of the twelve models, SPACE
+#     turns the whole layer on/off, up/down set the wet mix. 'a' on the video
+#     window also toggles the layer. --no-rave leaves it out; --rave-on
+#     starts with it on (models still chosen from the tab).
+#   - Models live in rave_layer.RAVE_MODEL_DIR (env AUDIBLE_LAVA_RAVE_DIR
+#     overrides); SuperCollider loads them when blob_synth_rave.scd is
+#     evaluated and writes rave_status.json there, which the tab shows.
+#
+# v4.10 (Nov 2026): rich synth palette (synth_palette.py + blob_synth_rich.scd).
+#   - Every SynthDef has a rich sibling (plugins from sc3-plugins with stock
+#     fallbacks) selected by name through synth_palette.install(); the OSC
+#     contract to SuperCollider is unchanged.
+#   - A master space (\lavaMaster, tail of group 0) is driven every frame by
+#     ScoreState: ambiguity -> reverb time, tension -> damping / drive, phrase
+#     position -> wet, surprisal -> Greyhole feedback, Kuramoto order ->
+#     modulation depth, blob count -> room size, grouping boundary -> bloom.
+#   - \preSound is finally wired: the predicted triad is pre-sounded at the
+#     harmony posterior's non-current mass (PreSoundLayer).
+#   - per-voice extras of \mpeVoiceRich: height -> vowel formant, area -> sub,
+#     sideways drift -> chorus (VoiceExtras).
+#   - hit models: ornamental hits are plucked strings, the paired head voice is
+#     a piano hammer; melody notes are bowed when a blob expands, plucked when
+#     it shrinks.
+#   Flags: --classic-synths (old SynthDef names, no extras), --no-space (no
+#   master insert), --no-presound. Key 'x' toggles the master bypass.
+#
+# v4.9.6 (Nov 2026): 'r' in the tracking window toggles a view of the frozen
+# background reference (reference | current frame | difference) and saves it
+# to background_reference.png.
 #
 # v4.9.4 (Nov 2026): pattern-layer hits are sent as OSC bundles stamped with
 # their due wall-clock time (send_timed_hits) instead of immediately; nothing
@@ -46,6 +90,15 @@
 #   python audible_lava.py --no-governor # drones only (no score grammar)
 #   python audible_lava.py --no-patterns # governor without the \mpeHit layer
 #   python audible_lava.py --no-melody   # start with the melody layer off
+#   python audible_lava.py --classic-synths  # v4.9 SynthDefs, no extras (v4.10)
+#   python audible_lava.py --no-space    # no master space insert (v4.10)
+#   python audible_lava.py --no-presound # no predicted-triad pre-sound (v4.10)
+#   python audible_lava.py --no-rave     # no RAVE layer at all (v4.11)
+#   python audible_lava.py --rave-on     # start with the RAVE layer on (v4.11)
+#
+# SuperCollider load order for the rich palette + RAVE:
+#   blob_synth.scd -> blob_synth_hits.scd -> melody_hit.scd
+#     -> blob_synth_rich.scd -> blob_synth_rave.scd
 #
 # v4.9.1: the Lava Climb game feed (lava_bridge.py / lava_climb.py) is removed
 # from the main loop; no UDP publisher is created.
@@ -59,6 +112,10 @@
 #   o    toggle blob contours
 #   v    toggle voice slot HUD
 #   n    toggle melody / rhythm layer                      (v4.9)
+#   x    toggle master space bypass (A/B the insert)       (v4.10)
+#   k    respawn the master space (clears reverb state)    (v4.10.3)
+#   p    toggle rich / classic synth palette live          (v4.10.4)
+#   a    toggle RAVE timbre-transfer layer                 (v4.11)
 #   b    re-capture background reference (configured mode) / reset MOG2
 #   w    re-capture background reference WARM (lamp already running) (v4.9)
 #   [    persistence threshold -
@@ -82,6 +139,8 @@ from voice_manager   import VoiceManager, VoiceState
 from binding_manager import BindingManager
 from score_governor  import ScoreGovernor           # v4.2 topological score grammar
 from melody_rhythm   import MelodyEngine            # v4.9 hazard onsets + band pitch
+import synth_palette                                # v4.10 rich palette + master space
+import rave_layer                                   # v4.11 RAVE timbre transfer
 from controller      import (
     KeyboardController,
     NOTE_ON, NOTE_OFF, SELECT_SLOT, SET_PARAM,
@@ -145,6 +204,28 @@ BLOB_RECENT_PLAY_WINDOW = 5.0
 # up to 0.6 notes/s); pitch from the blob's height band with hysteresis and
 # contour inertia. Tunables live in melody_rhythm.HazardParams / PitchParams.
 MELODY_ENABLED       = True
+
+# ── Synth palette (v4.10) ────────────────────────────────────────────────────
+# "rich"    : blob_synth_rich.scd SynthDefs (needs that file evaluated; the
+#             plugins are optional, stock fallbacks are built in)
+# "classic" : the v4.9 SynthDefs exactly as before. --classic-synths overrides.
+SYNTH_PALETTE        = "rich"
+MASTER_SPACE         = True       # \lavaMaster insert on bus 0 (--no-space)
+MASTER_DEPTH         = 1.0        # 0 = static default room, 1 = full ScoreState drive
+PRESOUND             = True       # predicted-triad pre-sound (--no-presound)
+PRESOUND_GAIN        = 0.10       # amplitude at posterior_other = 1
+
+# ── RAVE timbre transfer (v4.11) ─────────────────────────────────────────────
+# RAVE_LAYER installs the split node and the keyboard tab (--no-rave removes
+# both). The layer starts OFF (RAVE_ON_AT_START / --rave-on turn it on at
+# startup; models are still chosen from the tab), so by default the lamp
+# plays the rich SynthDefs untouched. RAVE_MIX is the wet fraction while on
+# (dry * (1 - mix) + sum of models at mix / sqrt(n)); RAVE_IN_GAIN drives the
+# dry copy into the models (RAVE likes a healthy input level).
+RAVE_LAYER           = True
+RAVE_ON_AT_START     = False
+RAVE_MIX             = 0.7
+RAVE_IN_GAIN         = 1.0
 
 PERS_STEP            = 2.0
 PERS_MIN             = 2.0
@@ -322,7 +403,7 @@ def draw_flow_overlay(overlay, flow, step=16, origin=(0, 0)):
 
 
 def draw_status(overlay, voices, leaves, blobs, fps,
-                warm_note, flags, pers_thresh, panel_w=320, extra=""):
+                warm_note, flags, pers_thresh, panel_w=320, extra="", extra2=""):
     """Top status bar + persistence threshold bar at the bottom-left."""
     h_img, w_img = overlay.shape[:2]
     counts = voices.hud_summary()
@@ -341,6 +422,9 @@ def draw_status(overlay, voices, leaves, blobs, fps,
     if extra:
         cv2.putText(overlay, extra, (10, 45),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 220, 200), 1)
+    if extra2:                                    # v4.10: synth palette / space line
+        cv2.putText(overlay, extra2, (10, 63),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 230), 1)
 
     bar_x  = 10
     bar_y  = h_img - 18
@@ -400,10 +484,11 @@ def send_timed_hits(osc, msgs, governor_now_s, wall_now_s):
     return n
 
 
-def dispatch_controller_event(ev, voices, binding, tracked):
+def dispatch_controller_event(ev, voices, binding, tracked, rave=None):
     """
     Some events need the BindingManager (lifecycle changes); the rest go
-    straight to VoiceManager.dispatch.
+    straight to VoiceManager.dispatch. v4.11: RAVE_* events go to the RAVE
+    layer and never reach the voice pool.
     """
     if ev.type == CREATE_EMPTY:
         binding.request_create_empty()
@@ -422,6 +507,14 @@ def dispatch_controller_event(ev, voices, binding, tracked):
         return
     if ev.type == QUIT:
         return
+    # v4.11: RAVE tab events
+    if str(ev.type).startswith("RAVE_"):
+        if rave is not None:
+            if rave.handle_controller_event(ev):
+                print(f"[RAVE] {rave.last_msg}")
+        else:
+            print("[RAVE] layer not installed (--no-rave)")
+        return
     # v4.2: EDIT-surface governor weights ("gov.<module>.<key>") -- live tuning
     if ev.type == SET_PARAM and getattr(ev, "param", None) and str(ev.param).startswith("gov."):
         gov = getattr(voices, "score_governor", None)
@@ -436,6 +529,14 @@ def main():
     force_calibrate = "--calibrate"   in sys.argv
     headless        = "--no-gui"      in sys.argv
     no_keyboard     = "--no-keyboard" in sys.argv
+    # v4.10 synth palette flags
+    palette_name    = "classic" if "--classic-synths" in sys.argv else SYNTH_PALETTE
+    palette         = synth_palette.PALETTES[palette_name]
+    use_space       = MASTER_SPACE and "--no-space" not in sys.argv
+    use_presound    = PRESOUND and "--no-presound" not in sys.argv
+    # v4.11 RAVE flags
+    use_rave        = RAVE_LAYER and "--no-rave" not in sys.argv
+    rave_on         = RAVE_ON_AT_START or "--rave-on" in sys.argv
 
     # ── Load or create LampProfile ────────────────────────────────────────
     profile = LampProfile.load(PROFILE_PATH) if not force_calibrate else None
@@ -511,8 +612,11 @@ def main():
     # Requires melody_hit.scd to have been evaluated in SuperCollider after
     # blob_synth.scd. Only blobs bound to a live slot play notes, so the layer
     # inherits the binding policy unchanged.
-    melody   = MelodyEngine(voices, profile,
-                            enabled=MELODY_ENABLED and "--no-melody" not in sys.argv)
+    # v4.10: constructed through the palette so the rich engine can add the
+    # bowed/plucked model per note (plain MelodyEngine for the classic palette).
+    melody   = synth_palette.make_melody_engine(
+        voices, profile, palette,
+        enabled=MELODY_ENABLED and "--no-melody" not in sys.argv)
 
     keyboard = None
     if not no_keyboard:
@@ -524,6 +628,9 @@ def main():
             print( "                 space = panic · TAB to enter EDIT")
             print( "   EDIT:        P/W/E/F/M family · arrows step · = / -")
             print( "                 B claim · N create-empty · T tie · D detach")
+            if use_rave:
+                print( "   RAVE:        home row = model on/off · space = layer on/off")
+                print( "                 up/dn = mix · Z all off · R re-read status · TAB back")
         except Exception as exc:
             print(f"[Startup] Keyboard controller failed: {exc}")
             keyboard = None
@@ -545,6 +652,49 @@ def main():
     # The gated \mpeHit pattern layer. Requires blob_synth_hits.scd to have
     # been evaluated in SuperCollider after blob_synth.scd.
     pattern_layer = use_governor and "--no-patterns" not in sys.argv
+
+    # ── v4.10 synth palette, master space, pre-sound ─────────────────────
+    # Installed AFTER VoiceManager (its /g_freeAll 0 would free the master
+    # node) and after the governor (whose scheduler it wraps). Requires
+    # blob_synth_rich.scd to have been evaluated for the "rich" palette; the
+    # classic palette uses the v4.9 SynthDefs and sends no extras.
+    rig = synth_palette.install(
+        voices, profile,
+        governor=governor if use_governor else None,
+        melody=melody,
+        palette=palette,
+        master=use_space,
+        presound=use_presound and use_governor,
+        master_depth=MASTER_DEPTH,
+        presound_gain=PRESOUND_GAIN,
+    )
+    print(f"[Startup] Synth palette: {palette.name}  "
+          f"space={'on' if rig.master is not None else 'off'}  "
+          f"presound={'on' if rig.presound is not None else 'off'}  ('x' = space bypass)")
+
+    # ── v4.11 RAVE timbre transfer ────────────────────────────────────────
+    # Installed AFTER the rig so the split and the model nodes can be placed
+    # before the master node (addBefore 900); without a master they go to the
+    # tail of group 0. Requires blob_synth_rave.scd to have been evaluated for
+    # anything to sound; with it missing the split's /s_new is a no-op in SC
+    # and the tab lists every model as unverified.
+    rave = None
+    if use_rave:
+        rave = rave_layer.install(
+            voices,
+            master_node=rig.master.node_id if rig.master is not None else None,
+            enabled=rave_on, mix=RAVE_MIX, in_gain=RAVE_IN_GAIN)
+        if keyboard is not None:
+            keyboard.enable_rave_tab(rave.panel_lines, rave_layer.RAVE_MODEL_KEYS)
+        n_loaded = sum(1 for s in rave.status.models.values() if s.status == "loaded")
+        print(f"[Startup] RAVE layer: {'on' if rave.enabled else 'off'}  "
+              f"models dir {rave_layer.RAVE_MODEL_DIR}  "
+              f"status: {n_loaded} loaded in SC"
+              + ("" if rave.status.models else " (no rave_status.json yet)")
+              + "  ('a' = layer on/off, RAVE tab = models)")
+    else:
+        print("[Startup] RAVE layer: not installed (--no-rave)")
+
     start_time     = time.time()
     frame_count    = 0
     last_blobs     = []   # most recent detection result (overlay continuity)
@@ -553,12 +703,13 @@ def main():
     show_track    = True
     show_flow     = False
     show_masks    = False
+    show_ref      = False   # v4.9.6: 'r' shows the frozen background reference
     show_contours = True
     show_hud      = True
 
     print("[OpenCV window keys] q=quit  m=tree  t=track  f=flow"
-          "  c=masks  o=contours  v=HUD  n=melody  b=rebaseline-bg"
-          "  w=rebaseline-warm  [/] persistence")
+          "  c=masks  o=contours  v=HUD  n=melody  x=space-bypass  k=space-respawn  p=palette  a=rave"
+          "  b=rebaseline-bg  w=rebaseline-warm  r=show-reference  [/] persistence")
     quit_requested = False
 
     try:
@@ -678,7 +829,7 @@ def main():
                         if ev.type == QUIT:
                             quit_requested = True
                             continue
-                        dispatch_controller_event(ev, voices, binding, tracked)
+                        dispatch_controller_event(ev, voices, binding, tracked, rave=rave)
 
                 # ── 6. Per-frame voice work (routing, smooth, send) ──────
                 voices.process_frame(tracked)
@@ -690,6 +841,28 @@ def main():
                 for nev in melody.process_frame(tracked):
                     print(f"  . note blob #{nev.blob_id} S{nev.slot_id:02d} "
                           f"m{nev.midi} {nev.freq:.0f}Hz dur={nev.dur:.2f}")
+
+                # ── 6c. v4.10: voice extras, master space, pre-sound ─────
+                # After process_frame so the extras address this frame's
+                # nodes; reads ScoreState (None with the governor off, which
+                # leaves the master at its neutral room and the pre-sound silent).
+                try:
+                    rig.update(voices.score_state if use_governor else None, tracked)
+                except Exception as exc:
+                    if not getattr(main, "_rig_warned", False):
+                        print(f"  ! synth palette error: {exc}")
+                        main._rig_warned = True
+
+                # ── 6d. v4.11: RAVE layer housekeeping (status-file poll) ─
+                # The layer only sends OSC on events; this re-reads
+                # rave_status.json when SC rewrites it so the tab stays true.
+                if rave is not None:
+                    try:
+                        rave.update()
+                    except Exception as exc:
+                        if not getattr(main, "_rave_warned", False):
+                            print(f"  ! rave layer error: {exc}")
+                            main._rave_warned = True
 
                 # ── 7. Log lifecycle events ──────────────────────────────
                 for event in tracker.events:
@@ -747,14 +920,46 @@ def main():
                             {"T": show_track, "M": show_tree,
                              "F": show_flow,  "C": show_masks,
                              "O": show_contours, "V": show_hud,
-                             "N": melody.enabled},
+                             "N": melody.enabled,
+                             "A": rave is not None and rave.enabled},   # v4.11
                             detector.pers_thresh,
-                            extra=melody.hud_line())
+                            extra=melody.hud_line(),
+                            extra2=rig.hud_line()
+                                   + (f"  {rave.hud_line()}" if rave is not None else ""))
 
                 draw_voice_hud(overlay, voices, keyboard, binding,
                                show_hud=show_hud)
 
-                cv2.imshow("Audible Lava v4.9.4 (MPE)", overlay)
+                cv2.imshow("Audible Lava v4.11 (MPE)", overlay)
+
+                # v4.9.6: the frozen background reference -- the "empty lamp"
+                # image every frame is differenced against. Shown next to the
+                # current frame and their difference so wax baked into the
+                # reference (ghosts) or missing from it stands out. Saved once
+                # per toggle to background_reference.png for closer inspection.
+                if show_ref:
+                    ref = getattr(getattr(detector, "bg_ref", None), "reference", None)
+                    if ref is None:
+                        blank = np.zeros_like(grey)
+                        cv2.putText(blank, "reference not captured yet", (8, 24),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1)
+                        cv2.imshow("Background reference", blank)
+                    else:
+                        if ref.shape != grey.shape:
+                            ref = cv2.resize(ref, (grey.shape[1], grey.shape[0]))
+                        diff = cv2.absdiff(grey, ref)
+                        diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+                        cv2.imshow("Background reference", np.hstack([ref, grey, diff]))
+                        if not getattr(main, "_ref_saved", False):
+                            cv2.imwrite("background_reference.png", ref)
+                            print("[Background] reference shown (left: reference, "
+                                  "middle: current frame, right: difference); "
+                                  "saved to background_reference.png")
+                            main._ref_saved = True
+                else:
+                    try: cv2.destroyWindow("Background reference")
+                    except: pass
+                    main._ref_saved = False
 
                 if show_masks:
                     masks = detector.get_debug_masks(roi, grey=grey)
@@ -773,10 +978,34 @@ def main():
                 elif key == ord("t"): show_track    = not show_track
                 elif key == ord("f"): show_flow     = not show_flow
                 elif key == ord("c"): show_masks    = not show_masks
+                elif key == ord("r"): show_ref      = not show_ref
                 elif key == ord("o"): show_contours = not show_contours
                 elif key == ord("v"): show_hud      = not show_hud
                 elif key == ord("n"):
                     print(f"[Melody] {'on' if melody.toggle() else 'off'}")
+                elif key == ord("x"):
+                    if rig.master is not None:
+                        print(f"[Space] master insert "
+                              f"{'BYPASSED' if rig.toggle_master_bypass() else 'active'}")
+                    else:
+                        print("[Space] master insert not installed (--no-space)")
+                elif key == ord("p"):                           # v4.10.4
+                    pal = rig.toggle_palette()
+                    print(f"[Synth] palette -> {pal.name}  (sustained voices migrate "
+                          f"as their slots respawn; hits / melody change at once)")
+                elif key == ord("k"):                           # v4.10.3
+                    if rig.master is not None:
+                        rig.master.respawn()
+                        print("[Space] master insert respawned")
+                    else:
+                        print("[Space] master insert not installed (--no-space)")
+                elif key == ord("a"):                           # v4.11
+                    if rave is not None:
+                        rave.toggle_enabled()
+                        print(f"[RAVE] {rave.last_msg}  active models: "
+                              f"{', '.join(m.key for m in rave.active_models()) or 'none'}")
+                    else:
+                        print("[RAVE] layer not installed (--no-rave)")
                 elif key == ord("]"):
                     detector.pers_thresh = min(
                         detector.pers_thresh + PERS_STEP, PERS_MAX)
@@ -818,7 +1047,19 @@ def main():
     finally:
         print("Releasing voices...")
         voices.release_all()
+        # v4.10: let the voices' releases pass through the master before it is
+        # freed (the pre-sound pads are gated first so they fade with them).
+        if rig.presound is not None:
+            rig.presound.close()
+        # v4.11: gate the RAVE model nodes now (they fade and free themselves);
+        # the split stays up until the fades are through so the dry mix and
+        # the fades keep passing to the master.
+        if rave is not None:
+            rave.close()
         time.sleep(3.5)
+        rig.close()
+        if rave is not None:
+            rave.free_split()
         cap.release()
         if SHOW_WINDOW and not headless:
             cv2.destroyAllWindows()

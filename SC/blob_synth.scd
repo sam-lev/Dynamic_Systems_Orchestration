@@ -1,5 +1,15 @@
 // blob_synth.scd -- Audible Lava / DSO v4.0 (MPE Edition)
 //
+// v4.11.6 (Nov 2026):
+//   * \blobStrike (classic palette only, --classic-synths) no longer feeds
+//     continuous noise into its Klank; the breathy shimmer is a separate,
+//     non-accumulating layer (see the SynthDef). Everything else unchanged.
+//   * libtorch / OpenMP thread settings for the RAVE layer (nn.ar) are set
+//     before boot: one intra-op thread per model and no busy-wait spinning.
+//     Measured on the Intel Mac with rave_bench.py: ~10-35 % less CPU per
+//     model and fewer dropouts. They must precede s.boot (scsynth inherits
+//     the environment of the process that launches it).
+//
 // v4.9.2 (Oct 2026) -- THE WAVETABLES WERE NEVER FILLED.
 //   The fill helpers called buf.sine1Msg(amps). In SuperCollider, *Msg
 //   methods only BUILD the OSC message and return it; they never send it.
@@ -44,6 +54,34 @@
 //s.freeAll;
 //s.reboot;
 //s.options.outDevice = "Pebble V3";
+//
+//                   Run Order at project initialization
+//
+// (1) blob_synth.scd — boots the server itself (s.options + s.boot are at the top, so you don’t need to boot separately; if you already did, it’s harmless).
+//         Wait for Audible Lava v4.9.2: SynthDefs ready (...) and wavetables filled (buffer 0 head: ...). Everything after this depends on the 16 wavetable buffers at ids 0–15.
+// (2) blob_synth_hits.scd — \mpeHit, \preSound.
+//         Wait for pattern-layer SynthDefs ready.
+// (3) melody_hit.scd — \melodyHit.
+//         Wait for \melodyHit ready.
+// (4) blob_synth_rich.scd — the rich palette and \lavaMaster.
+//         Wait for plugins found ... and Audible Lava v4.10: rich palette ready (...). If a plugin is listed as MISSING, the fallbacks are in use.
+// (5) blob_synth_rave.scd — the RAVE split and model nodes; writes rave_status.json.
+// (6) Then python audible_lava.py.
+//
+//
+//             For Basic, original run (no 'rich' synths, no RAVE)
+//
+//    python audible_lava.py --classic-synths --no-space --no-presound --no-rave
+//
+
+// for when restarting the server, leave commented out
+//Server.killAll;
+
+// manage CPU load
+"OMP_NUM_THREADS".setenv("1");     // v4.11.6: one libtorch thread per RAVE model
+"KMP_BLOCKTIME".setenv("0");       // v4.11.6: no OpenMP busy-wait spinning
+
+//init
 s.options.sampleRate         = 48000;
 s.options.numInputBusChannels = 0;
 s.boot;
@@ -254,19 +292,36 @@ s.waitForBoot({
     }).add;
 
     // ── \blobStrike (v3.x; Klank transient on birth) ──────────────────────
+    // v4.11.6: the Klank is struck by ONE impulse only. Before, it was
+    // excited by Impulse + WhiteNoise.ar(0.01) running CONTINUOUSLY into five
+    // resonators ringing up to 1.5 s; a resonator's gain on sustained input
+    // grows with its ring time, so that quiet noise built up toward full
+    // scale and smeared each birth into a metallic hiss (the same failure as
+    // the first v4.11 \blobStrikeRich, at a smaller scale).
+    // The breathy shimmer the noise gave is kept, OUTSIDE the resonators:
+    // white noise band-passed at the same inharmonic partials, on a short
+    // decaying envelope, so it shimmers with the ring but cannot accumulate.
+    // Ratios, pitch, decay and the control contract are unchanged; a Limiter
+    // (as \bassStutter has) is the ceiling.
     SynthDef(\blobStrike, {
         |freq=440, amp=0.4, decay=2.5, blobSize=0.5, position=0.5,
          elongation=0.0|
-        var sig, env, freqMod;
+        var sig, env, freqMod, ratios, len, breath;
+        ratios  = [1, 2.1, 3.3, 4.7, 6.2];
         freqMod = freq * (1.0 + elongation.clip(0, 1) * 0.12);
-        env = EnvGen.kr(Env.perc(0.001, decay * blobSize + 0.1),
-                        doneAction: 2);
+        len     = decay * blobSize + 0.1;
+        env = EnvGen.kr(Env.perc(0.001, len), doneAction: 2);
         sig = Klank.ar(
-            `[[1, 2.1, 3.3, 4.7, 6.2], nil, [1.5, 0.8, 0.6, 0.4, 0.2]],
-            Impulse.ar(0) + WhiteNoise.ar(0.01),
+            `[ratios, nil, [1.5, 0.8, 0.6, 0.4, 0.2]],
+            Impulse.ar(0),
             freqMod
         );
-        Out.ar(0, Pan2.ar(sig * env * amp, position * 2 - 1));
+        breath = Mix.new(
+            BPF.ar(WhiteNoise.ar(1.0), (freqMod * ratios).clip(20, 18000), 0.03)
+            * [0.5, 0.35, 0.25, 0.15, 0.1]
+        ) * 4.0 * EnvGen.kr(Env.perc(0.005, (len * 0.5).clip(0.05, 1.5), 1, -4));
+        sig = Limiter.ar(LeakDC.ar(sig + breath) * env * amp, 0.9);
+        Out.ar(0, Pan2.ar(sig, position * 2 - 1));
     }).add;
 
     // ── \bassStutter (gesture transform for existing low/falling/growing blobs) ──
@@ -365,6 +420,10 @@ x.set(\drive, 0.7);          // wavefold richness (area expansion)
 x.set(\detune, 0, \shimmer, 0, \noise, 0, \drive, 0);  // back to clean v4.0 tone
 x.set(\gate, 0);
 
+// Classic birth strike (v4.11.6: one impulse into the Klank + a separate,
+// non-accumulating shimmer layer):
+Synth(\blobStrike, [\freq, 330, \amp, 0.4, \decay, 2.5, \blobSize, 0.6, \elongation, 0.3]);
+Synth(\blobStrike, [\freq, 660, \amp, 0.4, \decay, 2.5, \blobSize, 0.9, \elongation, 0.0]);
 
 // bassStutter manual test:
 (

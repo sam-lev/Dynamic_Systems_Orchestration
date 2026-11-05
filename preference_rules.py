@@ -1,4 +1,9 @@
 # preference_rules.py -- Audible Lava / DSO v4.2
+#
+# v4.9.5: PreferenceRuleModule.update keeps the incumbent in the beam
+# (_beam), matches re-proposed candidates to old ones with same_candidate
+# (tolerance hook for continuous candidates), enters unseen candidates one
+# switching cost below the best path, and renormalises V. See _beam.
 # Shared preference-rule machinery (Temperley-style, incremental, real-time).
 #
 #   Rule                 -- f(evidence, candidate) -> [0,1], with a weight
@@ -221,14 +226,78 @@ class PreferenceRuleModule:
     def score(self, evidence: Dict[str, Any], c: Any) -> float:
         return sum(r.weight * r(evidence, c) for r in self.rules)
 
+    # v4.9.5: whether a re-proposed candidate that matches the incumbent
+    # should keep the incumbent's own values (True: a committed meter period
+    # stays put until a genuinely different period wins) or take the fresh
+    # proposal's (False: harmony candidates carry fields such as
+    # dist_from_current that are only valid relative to the current triad).
+    keep_incumbent_value: bool = False
+
+    def same_candidate(self, a: Any, b: Any) -> bool:
+        """Whether two candidates are the same hypothesis (so Viterbi state
+        carries over). Default: equal candidate_key. Subclasses with
+        continuous fields override this with a tolerance."""
+        return self.candidate_key(a) == self.candidate_key(b)
+
+    def _beam(self, proposed: List[Any]) -> List[Any]:
+        """The candidate set for this frame: proposals deduplicated by
+        same_candidate, the incumbent ALWAYS included, truncated to
+        beam_size with the incumbent kept.
+
+        v4.9.5. Before this the beam was `propose(evidence)[:beam_size]`.
+        Both subclasses rank their proposals by the current frame's score
+        and truncate, so the incumbent routinely fell out of the set before
+        Viterbi saw it; with no incumbent there is no path to stay on, the
+        switching cost never applies, and the decode reduces to argmax of
+        the current frame. That is why a run logged ~2.8 meter switches and
+        ~1.1 harmony switches per second whatever switch_cost was set to.
+        Continuous candidates (meter periods) also re-appeared each frame
+        with a slightly different value and therefore a new key, so they
+        never inherited Viterbi state either; same_candidate fixes that.
+        """
+        inc = self.committed
+        out: List[Any] = []
+        inc_idx = -1
+        for c in proposed:
+            if inc is not None and inc_idx < 0 and self.same_candidate(c, inc):
+                out.append(inc if self.keep_incumbent_value else c)
+                inc_idx = len(out) - 1
+                continue
+            if inc is not None and inc_idx >= 0 and self.same_candidate(c, inc):
+                continue
+            if any(self.same_candidate(c, d) for d in out):
+                continue
+            out.append(c)
+        if inc is not None and inc_idx < 0:
+            out.insert(0, inc)
+            inc_idx = 0
+        if len(out) > self.beam_size:
+            if inc_idx >= 0:
+                others = [c for k, c in enumerate(out) if k != inc_idx]
+                out = [out[inc_idx]] + others[: self.beam_size - 1]
+            else:
+                out = out[: self.beam_size]
+        return out
+
     def update(self, evidence: Dict[str, Any]) -> Any:
-        new = self.propose(evidence)[: self.beam_size]
+        new = self._beam(self.propose(evidence))
         if not new:
             return self.committed
-        # carry V across re-proposals by candidate key
-        old_map = {self.candidate_key(c): v for c, v in zip(self.candidates, self.V)}
-        prev_V = np.array([old_map.get(self.candidate_key(c), -self.switch_cost) for c in new])
-        prev_committed_key = self.candidate_key(self.committed) if self.committed is not None else None
+        # carry V across re-proposals by candidate identity (with tolerance)
+        prev_V = np.empty(len(new))
+        prev_max = float(self.V.max()) if len(self.V) else 0.0
+        for i, c in enumerate(new):
+            v = None
+            for oc, ov in zip(self.candidates, self.V):
+                if self.same_candidate(c, oc):
+                    v = float(ov)
+                    break
+            # an unseen hypothesis enters one switching cost below the best
+            # existing path (it was not the state we were in). The old
+            # absolute -switch_cost could exceed the incumbent's path when
+            # scores were < 1 (negative logs) and let newcomers in for free.
+            prev_V[i] = v if v is not None else prev_max - self.switch_cost
+        prev_committed = self.committed
 
         scores = np.array([self.score(evidence, c) for c in new], dtype=np.float64)
         self.last_scores = scores
@@ -242,13 +311,13 @@ class PreferenceRuleModule:
                 best = max(best, prev_V[j] - cost)
             V[i] = logs[i] + best
         V = V * self.forget
+        V = V - V.max()                                  # keep V bounded over long runs
         self.V, self.candidates = V, new
         z = V / max(self.temperature, 1e-6)
         z = z - z.max()
         self.posterior = np.exp(z) / np.exp(z).sum()
         idx = int(np.argmax(V))
-        new_key = self.candidate_key(new[idx])
-        if prev_committed_key is not None and new_key != prev_committed_key:
+        if prev_committed is not None and not self.same_candidate(new[idx], prev_committed):
             self.switches += 1
         self.committed_idx, self.committed = idx, new[idx]
         return self.committed

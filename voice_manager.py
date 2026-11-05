@@ -1,5 +1,6 @@
 # voice_manager.py -- Audible Lava / DSO v4.0 (MPE Edition)
 #
+# v4.9.4 (Nov 2026) -- resonance capped while the filter is high-pass (res_cap_hp).
 # v4.9.3 (Oct 2026) -- ROOT_NOTE lowered an octave (48 -> 36); nothing else changed.
 # v4.9.2 (Oct 2026) -- recreate the default group after /g_freeAll 0 at startup.
 # v4.9.1 (Oct 2026) -- two slot-leak fixes in the release path:
@@ -325,6 +326,8 @@ class VoiceManager:
         orphan_timeout_secs:    float = 3.0,
         blob_recent_play_window: float = 5.0,
     ) -> None:
+        # v4.9.4: max resonance at full high-pass (see _compute_targets)
+        self.res_cap_hp = 0.45
         self.osc       = udp_client.SimpleUDPClient(sc_ip, sc_port)
         # ── v4.2 score-grammar layer (additive). audible_lava sets
         # `score_state` each frame; `score_gain` (0..1) dials governance in
@@ -1179,6 +1182,15 @@ class VoiceManager:
                     t_drive   = max(0.0, min(1.0, t_drive   + shaped))
                 elif r.dest == Dest.FMODE:
                     t_fmode   = max(0.0, min(1.0, t_fmode   + shaped))
+
+        # v4.9.4: resonance is capped while the filter is in high-pass
+        # territory. A high-pass with resonance near 1 removes the
+        # fundamental and rings at its cutoff, so any cutoff modulation turns
+        # into a whistle; with fmode at 0.5 (band-pass) the cap is inactive
+        # and it tightens linearly to res_cap_hp at full high-pass.
+        hp = max(0.0, (t_fmode - 0.5) * 2.0)
+        if hp > 0.0:
+            t_res = min(t_res, 1.0 - (1.0 - self.res_cap_hp) * hp)
 
         # Final pitch: musical-space assembly -> Hz -> linear EDIT-mode
         # offset -> positive floor (20 Hz) so a deep negative nudge can

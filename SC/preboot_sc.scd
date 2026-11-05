@@ -1,6 +1,12 @@
+Server.killAll;
+//• Go to the top menu bar and click Language -> Reboot Interpreter.
+//• Once the post window completes the reboot process, try running s.boot; again.
 s.options.numInputBusChannels = 0;
 s.options.outDevice = "Pebble V3";
 s.reboot;
+
+//for plugins
+Platform.systemExtensionDir
 //SynthDescLib.global.synthDescs.keys.includes(\melodyHit)
 //~wtBuffers[0].bufnum;
 //Synth(\melodyHit, [\freq, 330, \amp, 0.4, \dur, 0.8, \bufBase, ~wtBuffers[0].bufnum]);

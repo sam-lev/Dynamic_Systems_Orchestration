@@ -1,4 +1,4 @@
-# Audible Lava / DSO — v4.9.4 complete tree
+# Audible Lava / DSO — v4.9.5 complete tree
 
 Every script in the project at its most recent version. Files not listed as
 changed are byte-identical to the originals in the project folder.
@@ -12,6 +12,7 @@ Verified with the real governor stack (stubs only for `h0_persistence`,
 | `test_score_grammar.py` | 21 passed |
 | `test_paired_voice.py` | 13 passed |
 | `claude/test_v493_changes.py` | 105 passed |
+| `test_beam_incumbent.py` | 15 passed (7 of them fail on the pre-fix code) |
 | `claude/test_melody_rhythm.py` | 59 passed |
 | `claude/test_merge_release.py` | 21 passed |
 | `test_v49_wiring.py` | 23 passed |
@@ -20,6 +21,44 @@ Verified with the real governor stack (stubs only for `h0_persistence`,
 ---
 
 ## Changed files
+
+### v4.9.5 (November 2026)
+
+**`preference_rules.py`** — the beam defect behind the meter and harmony
+churn. `PreferenceRuleModule.update` used `propose(evidence)[:beam_size]`,
+and both subclasses rank proposals by the current frame's score before
+truncating, so the incumbent routinely fell out of the set before Viterbi
+scored it; with no incumbent there is no path to stay on, `switch_cost` never
+applies, and the decode is argmax of one frame. New `_beam()` deduplicates
+proposals, always includes the incumbent, and truncates around it;
+`same_candidate()` lets continuous candidates match with a tolerance so they
+inherit Viterbi state; unseen candidates enter one switching cost below the
+best path (the old absolute `-switch_cost` let newcomers in free whenever
+scores were below 1); V is renormalised each frame. On a simulated churning
+lamp: meter switches 1.9/s → 0.08/s, beat-period jitter 0.11 → 0.006 s per
+second, triad changes 29 → 20 per minute from the code alone.
+
+**`score_governor.py`** — `MeterModule.same_candidate` treats periods within
+6 % with the same beat count as one hypothesis and keeps the committed
+period's own value (`keep_incumbent_value`); `HarmonyModule.propose` always
+keeps the stay-put triad and ranks only the moves.
+
+**`governor_weights.json`** — re-centred after the v4.9.3/4 fixes:
+`grouping.prior_phrase_secs` 9 → 22, `grouping.phrase_floor_secs` 8 → 10,
+`harmony.step_rate_gain` 6 → 1, `harmony.forget` 0.9 → 0.98. With the beam
+fix, same simulation: ~5 boundaries/min (was 14), a triad change every ~8 s
+(was every 2 s).
+
+**`controller.py`** — the EDIT window now shows the keys that switch family
+(`P W E F M G`), a one-line description of the family, the family's options
+as a list with the selected one highlighted (a window of seven around the
+selection, with step sizes), each option's description inline when the window
+is at least 840 px wide, and the selected option's description underneath in
+any case. Default window 880x440. `FAMILY_DOCS` / `PARAM_DOCS` hold the text.
+
+**`score_governor.py`** — `gov.grouping.reset_learning` fires only on the
+`r` key (a reset event). Arrows on it used to reset too; the run logged on
+2 November shows twelve resets inside four seconds from a held arrow.
 
 ### v4.9.4 (November 2026)
 
@@ -305,10 +344,8 @@ follows the code.
   prominence terms and most per-blob periodicity estimates are still starved
   by it. Verify the GUDHI fix is deployed, re-calibrate `pers_thresh`,
   re-capture the background warm, then tune tracker association.
-* **Two mechanism issues remain in the beam modules** (meter, harmony):
-  the meter proposal step evicts the incumbent before Viterbi sees it, so
-  `switch_cost` cannot behave as documented; and the Markov alphabet is large
-  enough relative to run length that `ambiguity` saturates at 1.0, making one of
-  four tension terms a constant.
+* The Markov alphabet is large enough relative to run length that `ambiguity`
+  can saturate at 1.0, making one of four tension terms a constant. (The beam
+  incumbent defect listed here before is fixed in v4.9.5.)
 * SuperCollider files are written to the existing conventions but have not been
   run against a live server here.
